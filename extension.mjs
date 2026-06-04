@@ -565,7 +565,7 @@ const PAGE_HTML = `<!doctype html>
         return renderPrRow({
           headerHtml: \`<span class="repo">\${esc(repo)}</span>\${link}\${draftBadge}\${syncBadge}\${sessionInfo}\`,
           titleHtml: esc(title),
-          metaHtml: meta,
+          metaHtml: '',
           gha: s._gha,
           azdo: s._azdo,
         });
@@ -653,7 +653,7 @@ const PAGE_HTML = `<!doctype html>
         return renderPrRow({
           headerHtml: \`<span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${syncBadge}\${sessionBadge}\`,
           titleHtml: esc(p.title),
-          metaHtml: meta,
+          metaHtml: '',
           gha: p.gha,
           azdo: p.azdo,
         });
