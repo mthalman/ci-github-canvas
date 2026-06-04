@@ -477,7 +477,6 @@ const PAGE_HTML = `<!doctype html>
     a:hover { text-decoration: underline; }
     .empty, .error, .loading { color: #888; padding: 1rem; text-align: center; }
     .error { color: #f85149; text-align: left; white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; }
-    .footer { color: #888; font-size: 0.75rem; margin-top: 0.75rem; }
   </style>
 </head>
 <body>
@@ -491,7 +490,6 @@ const PAGE_HTML = `<!doctype html>
   </div>
   <div class="panel active" id="panel-copilot"><div class="loading">Loading…</div></div>
   <div class="panel" id="panel-all"><div class="loading">Loading…</div></div>
-  <div class="footer" id="footer"></div>
 
   <script>
     const esc = (s) => s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -715,8 +713,6 @@ const PAGE_HTML = `<!doctype html>
       const errorBanner = res.error ? \`<div class="error">\${esc(res.error)}</div>\` : '';
       document.getElementById('panel-all').innerHTML = errorBanner + renderAll(res.rows ?? [], sessionIndex);
       document.getElementById('all-count').textContent = res.rows ? ' (' + res.rows.length + ')' : '';
-      const ageSec = res.cachedAt ? Math.round((Date.now() - res.cachedAt) / 1000) : null;
-      document.getElementById('footer').textContent = ageSec != null ? \`PR + CI data \${ageSec}s old\` : '';
     }
 
     document.querySelectorAll('.tab').forEach(btn => {
