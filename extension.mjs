@@ -392,8 +392,6 @@ const PAGE_HTML = `<!doctype html>
     details.azdo-jobs li { font-size: 0.75rem; font-family: ui-monospace, Consolas, monospace; padding: 0.1rem 0; display: flex; gap: 0.4rem; align-items: center; }
     a { color: #1f6feb; text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .session-link { font-size: 0.75rem; margin-left: auto; }
-    .a.badge.session-link { text-decoration: none; }
     .empty, .error, .loading { color: #888; padding: 1rem; text-align: center; }
     .error { color: #f85149; text-align: left; white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; }
     .footer { color: #888; font-size: 0.75rem; margin-top: 0.75rem; }
@@ -433,11 +431,11 @@ const PAGE_HTML = `<!doctype html>
         const draftBadge = s._liveDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
         const syncBadge  = s.sync_state ? \`<span class="badge sync-\${esc(s.sync_state)}" title="\${esc(syncTooltips[s.sync_state] ?? '')}">\${esc(s.sync_state.replace(/_/g,' '))}</span>\` : '';
         const link = url ? \`<a href="\${esc(url)}" target="_blank" rel="noopener">#\${esc(num)}</a>\` : (num ? \`#\${esc(num)}\` : '');
-        const sessionLink = s.workspace_id ? \`<a class="session-link" href="copilot://session/\${esc(s.workspace_id)}" title="Open this session">⏎ session</a>\` : '';
+        const sessionInfo = s.workspace_id ? \`<span class="badge session" title="Workspace ID: \${esc(s.workspace_id)}">session</span>\` : '';
         const updated = s._liveUpdatedAt ? \`updated \${new Date(s._liveUpdatedAt).toLocaleString()}\` : '';
         const meta = [head, updated].filter(Boolean).join(' · ');
         return \`<li class="row">
-          <div class="row-head"><span class="repo">\${esc(repo)}</span>\${link}\${draftBadge}\${syncBadge}\${sessionLink}</div>
+          <div class="row-head"><span class="repo">\${esc(repo)}</span>\${link}\${draftBadge}\${syncBadge}\${sessionInfo}</div>
           <div class="row-title">\${esc(title)}</div>
           <div class="row-meta">\${meta}</div>
           \${renderGha(s._gha)}
@@ -515,7 +513,7 @@ const PAGE_HTML = `<!doctype html>
         const key  = (repo + '#' + p.number).toLowerCase();
         const session = sessionIndex.get(key);
         const draft = p.isDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
-        const sessionBadge = session ? \`<a class="badge session session-link" href="copilot://session/\${esc(session.workspace_id)}" title="Open this session">in session ⏎</a>\` : '';
+        const sessionBadge = session ? \`<span class="badge session" title="A Copilot session is open for this PR (workspace \${esc(session.workspace_id)})">in session</span>\` : '';
         const syncBadge = session?.sync_state ? \`<span class="badge sync-\${esc(session.sync_state)}" title="\${esc(syncTooltips[session.sync_state] ?? '')}">\${esc(session.sync_state.replace(/_/g,' '))}</span>\` : '';
         const head = session?.source_pr_head_ref ? \`\${esc(session.source_pr_head_ref)} → \${esc(session.source_pr_base_ref ?? '')}\` : '';
         const updated = new Date(p.updatedAt).toLocaleString();
