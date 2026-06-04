@@ -294,7 +294,7 @@ const PAGE_HTML = `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>PR Pipelines</title>
+  <title>CI Runs</title>
   <style>
     :root { color-scheme: light dark; }
     body { font: 14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; padding: 1rem; }
@@ -351,7 +351,7 @@ const PAGE_HTML = `<!doctype html>
 </head>
 <body>
   <header>
-    <h1>PR Pipelines</h1>
+    <h1>CI Runs</h1>
     <button class="refresh" id="refresh">↻ Refresh</button>
   </header>
   <div class="tabs">
@@ -532,7 +532,7 @@ const session = await joinSession({
     canvases: [
         createCanvas({
             id: "pr-pipelines",
-            displayName: "PR Pipelines",
+            displayName: "CI Runs",
             description:
                 "Side-panel dashboard with two tabs: (1) Copilot sessions currently open in the desktop app with their PR/issue origin; (2) all open pull requests the user authored across GitHub. Cross-links the two so the user can see which of their PRs already have a Copilot session.",
             actions: [
@@ -560,7 +560,7 @@ const session = await joinSession({
                 }
                 const rows = fetchCopilotSessions();
                 const sessionCount = Array.isArray(rows) ? rows.length : 0;
-                return { title: "PR Pipelines", url: entry.url, status: `${sessionCount} active session${sessionCount === 1 ? "" : "s"}` };
+                return { title: "CI Runs", url: entry.url, status: `${sessionCount} active session${sessionCount === 1 ? "" : "s"}` };
             },
             onClose: async (ctx) => {
                 const entry = servers.get(ctx.instanceId);
