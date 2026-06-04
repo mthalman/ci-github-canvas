@@ -1,4 +1,4 @@
-// Extension: pr-pipelines (v0.2)
+// Extension: pr-pipelines (v0.3)
 //
 // User-scoped canvas: side-panel dashboard with two tabs.
 //   1. "Copilot" tab  - workspaces currently open in the desktop app, with
@@ -7,7 +7,7 @@
 //                       Source: `gh search prs --author=@me --state=open`.
 // Cross-link: PRs that appear in both tabs get a "in session" badge in tab 2.
 //
-// v0 does not show CI/pipeline status yet - that comes in v1.
+// CI status: shows both Azure Pipelines and GitHub Actions workflow runs.
 //
 // Runtime: Node 24+ (uses node:sqlite, no npm deps).
 
@@ -198,6 +198,7 @@ async function fetchPrsWithChecks({ force = false } = {}) {
                 for (const run of suite?.checkRuns?.nodes ?? []) allRuns.push(run);
             }
             const azdo = summarizeAzdoRuns(allRuns);
+            const gha = summarizeGhaRuns(allRuns);
             return {
                 number: p.number,
                 title: p.title,
@@ -208,6 +209,7 @@ async function fetchPrsWithChecks({ force = false } = {}) {
                 repository: p.repository,
                 headSha: commit?.oid,
                 azdo,
+                gha,
             };
         });
     checksCache = { at: now, value: shaped, error: null };
@@ -262,6 +264,57 @@ function summarizeAzdoRuns(runs) {
     return {
         hasAny: true,
         builds: [...builds.values()].sort((a, b) => Number(b.buildId ?? 0) - Number(a.buildId ?? 0)),
+        summary,
+    };
+}
+
+// Reduce non-AzDO check runs into GitHub Actions workflow buckets, grouped by workflow name.
+// Returns { workflows: [...], summary: { total, success, failure, inProgress, ... }, hasAny }.
+function summarizeGhaRuns(runs) {
+    const ghaRuns = runs.filter((r) => r?.detailsUrl && !AZDO_URL_RE.test(r.detailsUrl));
+    if (ghaRuns.length === 0) {
+        return { hasAny: false, workflows: [], summary: null };
+    }
+    // Group by workflow name (the part before the " / " separator in the check run name).
+    const workflows = new Map();
+    for (const r of ghaRuns) {
+        const parts = r.name.split(" / ");
+        const workflowName = parts.length > 1 ? parts[0] : r.name;
+        let entry = workflows.get(workflowName);
+        if (!entry) {
+            // Derive workflow URL from detailsUrl (strip job-specific path segments)
+            const workflowUrl = r.detailsUrl
+                ? r.detailsUrl.replace(/\/job\/[^?#]*/, "")
+                : null;
+            entry = { name: workflowName, url: workflowUrl, runs: [] };
+            workflows.set(workflowName, entry);
+        }
+        entry.runs.push({
+            name: r.name,
+            status: r.status,
+            conclusion: r.conclusion,
+            detailsUrl: r.detailsUrl,
+            startedAt: r.startedAt,
+            completedAt: r.completedAt,
+        });
+    }
+    const summary = { total: 0, success: 0, failure: 0, inProgress: 0, other: 0 };
+    for (const w of workflows.values()) {
+        for (const r of w.runs) {
+            summary.total++;
+            if (r.status !== "COMPLETED") summary.inProgress++;
+            else if (r.conclusion === "SUCCESS" || r.conclusion === "NEUTRAL" || r.conclusion === "SKIPPED") summary.success++;
+            else if (r.conclusion === "FAILURE" || r.conclusion === "TIMED_OUT" || r.conclusion === "STARTUP_FAILURE" || r.conclusion === "ACTION_REQUIRED") summary.failure++;
+            else summary.other++;
+        }
+    }
+    summary.overall =
+        summary.failure > 0 ? "failure" :
+        summary.inProgress > 0 ? "in_progress" :
+        summary.success > 0 ? "success" : "other";
+    return {
+        hasAny: true,
+        workflows: [...workflows.values()].sort((a, b) => a.name.localeCompare(b.name)),
         summary,
     };
 }
@@ -425,6 +478,32 @@ const PAGE_HTML = `<!doctype html>
       </div>\`;
     }
 
+    function renderGha(gha) {
+      if (!gha || !gha.hasAny) return '';
+      const s = gha.summary;
+      const overallDot = '<span class="ci-dot ' + s.overall + '"></span>';
+      const counts = [
+        s.success     ? \`<span title="passed">✓ \${s.success}</span>\` : '',
+        s.failure     ? \`<span title="failed" style="color:#f85149">✕ \${s.failure}</span>\` : '',
+        s.inProgress  ? \`<span title="in progress" style="color:#d29922">⟳ \${s.inProgress}</span>\` : '',
+        s.other       ? \`<span title="other">· \${s.other}</span>\` : '',
+      ].filter(Boolean).join(' ');
+      const workflowLines = gha.workflows.map(w => {
+        const label = w.url
+          ? \`<a href="\${esc(w.url)}" target="_blank" rel="noopener">\${esc(w.name)}</a>\`
+          : esc(w.name);
+        const jobs = w.runs.map(r => \`<li><span class="ci-dot \${runDotClass(r)}"></span><a href="\${esc(r.detailsUrl)}" target="_blank" rel="noopener">\${esc(r.name)}</a> <span class="label">\${esc(runStatusLabel(r))}</span></li>\`).join('');
+        return \`<div class="azdo-build">
+          <div class="azdo-line">\${label} <span class="label">· \${w.runs.length} job\${w.runs.length === 1 ? '' : 's'}</span></div>
+          <details class="azdo-jobs"><summary>show jobs</summary><ul>\${jobs}</ul></details>
+        </div>\`;
+      }).join('');
+      return \`<div class="azdo">
+        <div class="azdo-line">\${overallDot}<strong>GitHub Actions</strong> <span class="label">\${counts}</span></div>
+        \${workflowLines}
+      </div>\`;
+    }
+
     function renderAll(prs, sessionKeys) {
       if (!prs.length) return '<div class="empty">No open PRs authored by you.</div>';
       return '<ul class="list">' + prs.map(p => {
@@ -438,6 +517,7 @@ const PAGE_HTML = `<!doctype html>
           <div class="row-head"><span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${session}</div>
           <div class="row-title">\${esc(p.title)}</div>
           <div class="row-meta">updated \${esc(updated)}</div>
+          \${renderGha(p.gha)}
           \${renderAzdo(p.azdo)}
         </li>\`;
       }).join('') + '</ul>';
@@ -547,6 +627,7 @@ const session = await joinSession({
                             sessionCount: Array.isArray(sessions) ? sessions.length : 0,
                             prCount: checks.data?.length ?? 0,
                             azdoBuilds: (checks.data ?? []).reduce((n, p) => n + (p.azdo?.builds?.length ?? 0), 0),
+                            ghaWorkflows: (checks.data ?? []).reduce((n, p) => n + (p.gha?.workflows?.length ?? 0), 0),
                             errors: [sessions?.__error, checks.error].filter(Boolean),
                         };
                     },
@@ -573,4 +654,4 @@ const session = await joinSession({
     ],
 });
 
-await session.log("pr-pipelines extension ready (v0.2)");
+await session.log("pr-pipelines extension ready (v0.3)");
