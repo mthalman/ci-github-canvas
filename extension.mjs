@@ -428,16 +428,16 @@ const PAGE_HTML = `<!doctype html>
         const repo  = s.repo_full_name ?? s.created_pr_repo ?? s.issue_repo ?? '(unknown repo)';
         const title = s._liveTitle ?? s.source_pr_title ?? s.workspace_name ?? '(untitled)';
         const head  = s.source_pr_head_ref ? \`\${esc(s.source_pr_head_ref)} → \${esc(s.source_pr_base_ref ?? '')}\` : esc(s.branch ?? '');
-        const author = s.source_pr_author_login ? \`by \${esc(s.source_pr_author_login)}\` : '';
         const typeBadge = isPr ? '<span class="badge pr">PR</span>' : isIss ? '<span class="badge issue">Issue</span>' : '';
-        const stateBadge = s.source_pr_state ? \`<span class="badge \${esc(s.source_pr_state)}">\${esc(s.source_pr_state)}</span>\` : '';
+        const draftBadge = s._liveDraft ? '<span class="badge draft">draft</span>' : '';
         const syncBadge  = s.sync_state ? \`<span class="badge sync-\${esc(s.sync_state)}">\${esc(s.sync_state.replace(/_/g,' '))}</span>\` : '';
         const link = url ? \`<a href="\${esc(url)}" target="_blank" rel="noopener">#\${esc(num)}</a>\` : (num ? \`#\${esc(num)}\` : '');
-        const project = s.project_name ? \`<span class="project">\${esc(s.project_name)}</span>\` : '';
+        const updated = s._liveUpdatedAt ? \`updated \${new Date(s._liveUpdatedAt).toLocaleString()}\` : '';
+        const meta = [head, updated].filter(Boolean).join(' · ');
         return \`<li class="row">
-          <div class="row-head">\${project}<span class="repo">\${esc(repo)}</span>\${link}\${typeBadge}\${stateBadge}\${syncBadge}</div>
+          <div class="row-head"><span class="repo">\${esc(repo)}</span>\${link}\${typeBadge}\${draftBadge}\${syncBadge}</div>
           <div class="row-title">\${esc(title)}</div>
-          <div class="row-meta">\${head} \${author}</div>
+          <div class="row-meta">\${meta}</div>
           \${renderGha(s._gha)}
           \${renderAzdo(s._azdo)}
         </li>\`;
@@ -506,19 +506,22 @@ const PAGE_HTML = `<!doctype html>
       </div>\`;
     }
 
-    function renderAll(prs, sessionKeys) {
+    function renderAll(prs, sessionIndex) {
       if (!prs.length) return '<div class="empty">No open PRs authored by you.</div>';
       return '<ul class="list">' + prs.map(p => {
         const repo = p.repository.nameWithOwner;
         const key  = (repo + '#' + p.number).toLowerCase();
-        const hasSession = sessionKeys.has(key);
+        const session = sessionIndex.get(key);
         const draft = p.isDraft ? '<span class="badge draft">draft</span>' : '';
-        const session = hasSession ? '<span class="badge session" title="A Copilot session is open for this PR">in session</span>' : '';
+        const sessionBadge = session ? '<span class="badge session" title="A Copilot session is open for this PR">in session</span>' : '';
+        const syncBadge = session?.sync_state ? \`<span class="badge sync-\${esc(session.sync_state)}">\${esc(session.sync_state.replace(/_/g,' '))}</span>\` : '';
+        const head = session?.source_pr_head_ref ? \`\${esc(session.source_pr_head_ref)} → \${esc(session.source_pr_base_ref ?? '')}\` : '';
         const updated = new Date(p.updatedAt).toLocaleString();
+        const meta = [head, \`updated \${updated}\`].filter(Boolean).join(' · ');
         return \`<li class="row">
-          <div class="row-head"><span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${session}</div>
+          <div class="row-head"><span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${sessionBadge}\${syncBadge}</div>
           <div class="row-title">\${esc(p.title)}</div>
-          <div class="row-meta">updated \${esc(updated)}</div>
+          <div class="row-meta">\${meta}</div>
           \${renderGha(p.gha)}
           \${renderAzdo(p.azdo)}
         </li>\`;
@@ -551,7 +554,7 @@ const PAGE_HTML = `<!doctype html>
         const repo = s.repo_full_name ?? s.created_pr_repo;
         const key = repo && prNum ? (repo + '#' + prNum).toLowerCase() : null;
         const ci = key ? ciIndex.get(key) : null;
-        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null, _liveTitle: ci?.title ?? null, _liveUpdatedAt: ci?.updatedAt ?? null };
+        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null, _liveTitle: ci?.title ?? null, _liveUpdatedAt: ci?.updatedAt ?? null, _liveDraft: ci?.isDraft ?? false };
       });
       document.getElementById('panel-copilot').innerHTML = renderCopilot(enriched);
       document.getElementById('copilot-count').textContent = ' (' + res.rows.length + ')';
@@ -559,13 +562,13 @@ const PAGE_HTML = `<!doctype html>
 
     async function loadAll(force=false) {
       const res = await fetch('/api/prs-with-checks' + (force ? '?force=1' : '')).then(r => r.json());
-      const sessionKeys = new Set();
+      const sessionIndex = new Map();
       for (const s of lastSessions) {
-        if (s.repo_full_name && s.source_pr_number)  sessionKeys.add((s.repo_full_name + '#' + s.source_pr_number).toLowerCase());
-        if (s.created_pr_repo && s.created_pr_number) sessionKeys.add((s.created_pr_repo + '#' + s.created_pr_number).toLowerCase());
+        if (s.repo_full_name && s.source_pr_number)  sessionIndex.set((s.repo_full_name + '#' + s.source_pr_number).toLowerCase(), s);
+        if (s.created_pr_repo && s.created_pr_number) sessionIndex.set((s.created_pr_repo + '#' + s.created_pr_number).toLowerCase(), s);
       }
       const errorBanner = res.error ? \`<div class="error">\${esc(res.error)}</div>\` : '';
-      document.getElementById('panel-all').innerHTML = errorBanner + renderAll(res.rows ?? [], sessionKeys);
+      document.getElementById('panel-all').innerHTML = errorBanner + renderAll(res.rows ?? [], sessionIndex);
       document.getElementById('all-count').textContent = res.rows ? ' (' + res.rows.length + ')' : '';
       const ageSec = res.cachedAt ? Math.round((Date.now() - res.cachedAt) / 1000) : null;
       document.getElementById('footer').textContent = ageSec != null ? \`PR + CI data \${ageSec}s old\` : '';
