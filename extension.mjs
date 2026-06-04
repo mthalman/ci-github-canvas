@@ -426,7 +426,7 @@ const PAGE_HTML = `<!doctype html>
         const num   = s.source_pr_number ?? s.created_pr_number ?? s.source_issue_number;
         const url   = s.source_pr_html_url ?? s.created_pr_html_url ?? (s.issue_repo && s.source_issue_number ? \`https://github.com/\${s.issue_repo}/issues/\${s.source_issue_number}\` : null);
         const repo  = s.repo_full_name ?? s.created_pr_repo ?? s.issue_repo ?? '(unknown repo)';
-        const title = s.source_pr_title ?? s.workspace_name ?? '(untitled)';
+        const title = s._liveTitle ?? s.source_pr_title ?? s.workspace_name ?? '(untitled)';
         const head  = s.source_pr_head_ref ? \`\${esc(s.source_pr_head_ref)} → \${esc(s.source_pr_base_ref ?? '')}\` : esc(s.branch ?? '');
         const author = s.source_pr_author_login ? \`by \${esc(s.source_pr_author_login)}\` : '';
         const typeBadge = isPr ? '<span class="badge pr">PR</span>' : isIss ? '<span class="badge issue">Issue</span>' : '';
@@ -551,7 +551,7 @@ const PAGE_HTML = `<!doctype html>
         const repo = s.repo_full_name ?? s.created_pr_repo;
         const key = repo && prNum ? (repo + '#' + prNum).toLowerCase() : null;
         const ci = key ? ciIndex.get(key) : null;
-        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null };
+        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null, _liveTitle: ci?.title ?? null, _liveUpdatedAt: ci?.updatedAt ?? null };
       });
       document.getElementById('panel-copilot').innerHTML = renderCopilot(enriched);
       document.getElementById('copilot-count').textContent = ' (' + res.rows.length + ')';
