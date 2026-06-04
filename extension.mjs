@@ -1,13 +1,13 @@
-// Extension: pr-pipelines (v0.2)
+// Extension: pr-pipelines (v0.3)
 //
 // User-scoped canvas: side-panel dashboard with two tabs.
 //   1. "Copilot" tab  - workspaces currently open in the desktop app, with
 //                       their PR or issue origin. Source: ~/.copilot/data.db.
 //   2. "All PRs" tab  - every open PR the user authored across all of GitHub.
 //                       Source: `gh search prs --author=@me --state=open`.
-// Cross-link: PRs that appear in both tabs get a "in session" badge in tab 2.
+// Cross-link: PRs that appear in both tabs get a "session" badge in tab 2.
 //
-// v0 does not show CI/pipeline status yet - that comes in v1.
+// CI status: shows both Azure Pipelines and GitHub Actions workflow runs.
 //
 // Runtime: Node 24+ (uses node:sqlite, no npm deps).
 
@@ -24,6 +24,8 @@ const DB_PATH = join(homedir(), ".copilot", "data.db");
 const GH_CACHE_TTL_MS = 60_000;
 // GraphQL-with-checks is heavier and more expensive on the rate limit.
 const CHECKS_CACHE_TTL_MS = 90_000;
+// Agent tasks list is used to map local session_ids to remote task URLs.
+const TASKS_CACHE_TTL_MS = 60_000;
 // Azure DevOps check runs are identified by detailsUrl host. Covers
 // dev.azure.com/<org> as well as legacy <org>.visualstudio.com URLs.
 const AZDO_URL_RE = /^https?:\/\/(dev\.azure\.com|[^/]+\.visualstudio\.com)\//i;
@@ -46,6 +48,7 @@ function fetchCopilotSessions() {
     const sql = `
         SELECT
             w.id          AS workspace_id,
+            w.session_id  AS session_id,
             w.name        AS workspace_name,
             w.branch      AS branch,
             w.updated_at  AS updated_at,
@@ -64,9 +67,6 @@ function fetchCopilotSessions() {
             COALESCE(w.created_pr_number,        c.created_pr_number) AS created_pr_number,
             COALESCE(w.created_pr_html_url,      c.created_pr_html_url) AS created_pr_html_url,
             COALESCE(w.created_pr_state,         c.created_pr_state) AS created_pr_state,
-
-            COALESCE(w.source_issue_repo_full_name, c.repo_full_name) AS issue_repo,
-            COALESCE(w.source_issue_number,         c.source_issue_number) AS source_issue_number,
 
             s.state           AS sync_state,
             s.local_head_sha  AS local_head_sha,
@@ -198,6 +198,7 @@ async function fetchPrsWithChecks({ force = false } = {}) {
                 for (const run of suite?.checkRuns?.nodes ?? []) allRuns.push(run);
             }
             const azdo = summarizeAzdoRuns(allRuns);
+            const gha = summarizeGhaRuns(allRuns);
             return {
                 number: p.number,
                 title: p.title,
@@ -208,10 +209,71 @@ async function fetchPrsWithChecks({ force = false } = {}) {
                 repository: p.repository,
                 headSha: commit?.oid,
                 azdo,
+                gha,
             };
         });
     checksCache = { at: now, value: shaped, error: null };
     return { data: shaped, cachedAt: now, error: null };
+}
+
+// Map local Copilot session_ids to remote task URLs by querying the
+// `api.githubcopilot.com/agents/tasks` endpoint. The desktop app exports each
+// local session to a server-side task whose UUID is what shows up in the
+// `github.com/<owner>/<repo>/tasks/<task-id>` web URL. Tasks are linked back
+// to local sessions through `agent_collaborators[].agent_task_id`.
+let tasksCache = { at: 0, value: null, error: null };
+function runGhAuthToken() {
+    return new Promise((resolve) => {
+        const child = spawn("gh", ["auth", "token"], { shell: false, windowsHide: true });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => (stdout += chunk.toString()));
+        child.stderr.on("data", (chunk) => (stderr += chunk.toString()));
+        child.on("error", (err) => resolve({ error: err.message }));
+        child.on("close", (code) => {
+            if (code === 0) resolve({ token: stdout.trim() });
+            else resolve({ error: stderr.trim() || `gh auth token exited with code ${code}` });
+        });
+    });
+}
+async function fetchAgentTasks({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && tasksCache.value && now - tasksCache.at < TASKS_CACHE_TTL_MS) {
+        return { data: tasksCache.value, cachedAt: tasksCache.at, error: tasksCache.error };
+    }
+    const tokenResult = await runGhAuthToken();
+    if (tokenResult.error) {
+        tasksCache = { at: now, value: tasksCache.value, error: tokenResult.error };
+        return { data: tasksCache.value ?? new Map(), cachedAt: now, error: tokenResult.error };
+    }
+    try {
+        const res = await fetch("https://api.githubcopilot.com/agents/tasks", {
+            headers: {
+                Authorization: `Bearer ${tokenResult.token}`,
+                "Copilot-Integration-Id": "copilot-developer-app",
+                "Editor-Version": "copilot-cli-extension/1.0",
+                Accept: "application/json",
+            },
+        });
+        if (!res.ok) {
+            const msg = `tasks API HTTP ${res.status}`;
+            tasksCache = { at: now, value: tasksCache.value, error: msg };
+            return { data: tasksCache.value ?? new Map(), cachedAt: now, error: msg };
+        }
+        const body = await res.json();
+        // Build session_id -> task_id map
+        const map = new Map();
+        for (const t of body.tasks ?? []) {
+            for (const c of t.agent_collaborators ?? []) {
+                if (c.agent_task_id) map.set(c.agent_task_id, t.id);
+            }
+        }
+        tasksCache = { at: now, value: map, error: null };
+        return { data: map, cachedAt: now, error: null };
+    } catch (err) {
+        tasksCache = { at: now, value: tasksCache.value, error: err.message };
+        return { data: tasksCache.value ?? new Map(), cachedAt: now, error: err.message };
+    }
 }
 
 // Reduce a flat list of check runs into AzDO-only buckets, grouped by buildId.
@@ -266,6 +328,57 @@ function summarizeAzdoRuns(runs) {
     };
 }
 
+// Reduce non-AzDO check runs into GitHub Actions workflow buckets, grouped by workflow name.
+// Returns { workflows: [...], summary: { total, success, failure, inProgress, ... }, hasAny }.
+function summarizeGhaRuns(runs) {
+    const ghaRuns = runs.filter((r) => r?.detailsUrl && !AZDO_URL_RE.test(r.detailsUrl));
+    if (ghaRuns.length === 0) {
+        return { hasAny: false, workflows: [], summary: null };
+    }
+    // Group by workflow name (the part before the " / " separator in the check run name).
+    const workflows = new Map();
+    for (const r of ghaRuns) {
+        const parts = r.name.split(" / ");
+        const workflowName = parts.length > 1 ? parts[0] : r.name;
+        let entry = workflows.get(workflowName);
+        if (!entry) {
+            // Derive workflow URL from detailsUrl (strip job-specific path segments)
+            const workflowUrl = r.detailsUrl
+                ? r.detailsUrl.replace(/\/job\/[^?#]*/, "")
+                : null;
+            entry = { name: workflowName, url: workflowUrl, runs: [] };
+            workflows.set(workflowName, entry);
+        }
+        entry.runs.push({
+            name: r.name,
+            status: r.status,
+            conclusion: r.conclusion,
+            detailsUrl: r.detailsUrl,
+            startedAt: r.startedAt,
+            completedAt: r.completedAt,
+        });
+    }
+    const summary = { total: 0, success: 0, failure: 0, inProgress: 0, other: 0 };
+    for (const w of workflows.values()) {
+        for (const r of w.runs) {
+            summary.total++;
+            if (r.status !== "COMPLETED") summary.inProgress++;
+            else if (r.conclusion === "SUCCESS" || r.conclusion === "NEUTRAL" || r.conclusion === "SKIPPED") summary.success++;
+            else if (r.conclusion === "FAILURE" || r.conclusion === "TIMED_OUT" || r.conclusion === "STARTUP_FAILURE" || r.conclusion === "ACTION_REQUIRED") summary.failure++;
+            else summary.other++;
+        }
+    }
+    summary.overall =
+        summary.failure > 0 ? "failure" :
+        summary.inProgress > 0 ? "in_progress" :
+        summary.success > 0 ? "success" : "other";
+    return {
+        hasAny: true,
+        workflows: [...workflows.values()].sort((a, b) => a.name.localeCompare(b.name)),
+        summary,
+    };
+}
+
 // Build a quick lookup key for cross-referencing tab 2 against tab 1.
 // Format: "<repo_full_name>#<pr_number>".
 function prKey(repo, number) {
@@ -316,8 +429,6 @@ const PAGE_HTML = `<!doctype html>
     .project { background: color-mix(in srgb, currentColor 8%, transparent); font-size: 0.75rem; }
     .repo { color: #888; font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; background: none; padding: 0; }
     .badge { text-transform: uppercase; letter-spacing: 0.03em; }
-    .badge.pr      { background: rgba(46,160,67,0.2); color: #2ea043; }
-    .badge.issue   { background: rgba(31,111,235,0.2); color: #1f6feb; }
     .badge.draft   { background: rgba(139,148,158,0.25); color: #8b949e; }
     .badge.session { background: rgba(210,153,34,0.2); color: #d29922; }
     .badge.closed  { background: rgba(248,81,73,0.2); color: #f85149; }
@@ -342,11 +453,30 @@ const PAGE_HTML = `<!doctype html>
     details.azdo-jobs summary { cursor: pointer; font-size: 0.75rem; color: #888; list-style: revert; }
     details.azdo-jobs ul { list-style: none; padding-left: 1rem; margin: 0.25rem 0 0; }
     details.azdo-jobs li { font-size: 0.75rem; font-family: ui-monospace, Consolas, monospace; padding: 0.1rem 0; display: flex; gap: 0.4rem; align-items: center; }
+
+    /* Collapsible PR rows. Default-open unless every CI check passed. */
+    li.row-collapsible { padding: 0; }
+    li.row-collapsible > details > summary {
+      cursor: pointer; list-style: none;
+      padding: 0.6rem 0.75rem;
+      display: flex; gap: 0.5rem; align-items: flex-start;
+    }
+    li.row-collapsible > details > summary::-webkit-details-marker { display: none; }
+    li.row-collapsible > details > summary::marker { content: ''; }
+    li.row-collapsible .caret {
+      flex: 0 0 auto; color: #888; font-size: 0.7rem; line-height: 1.5;
+      transition: transform 0.15s ease;
+      transform: rotate(0deg);
+      width: 0.7rem;
+    }
+    li.row-collapsible > details[open] > summary .caret { transform: rotate(90deg); }
+    li.row-collapsible .row-summary-content { flex: 1 1 auto; min-width: 0; }
+    li.row-collapsible > details > .row-body { padding: 0 0.75rem 0.6rem 1.95rem; }
+    li.row-collapsible .ci-dot.overall { width: 0.7rem; height: 0.7rem; margin-left: auto; }
     a { color: #1f6feb; text-decoration: none; }
     a:hover { text-decoration: underline; }
     .empty, .error, .loading { color: #888; padding: 1rem; text-align: center; }
     .error { color: #f85149; text-align: left; white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; }
-    .footer { color: #888; font-size: 0.75rem; margin-top: 0.75rem; }
   </style>
 </head>
 <body>
@@ -360,32 +490,83 @@ const PAGE_HTML = `<!doctype html>
   </div>
   <div class="panel active" id="panel-copilot"><div class="loading">Loading…</div></div>
   <div class="panel" id="panel-all"><div class="loading">Loading…</div></div>
-  <div class="footer" id="footer"></div>
 
   <script>
     const esc = (s) => s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+    const syncTooltips = {
+      'up_to_date': 'Local session is in sync with the remote branch',
+      'behind': 'Remote branch has commits not yet pulled locally',
+      'ahead': 'Local session has commits not yet pushed to remote',
+      'diverged': 'Local and remote have diverged with different commits',
+    };
+
+    const overallCiTooltips = {
+      success: 'All CI checks passed',
+      failure: 'One or more CI checks failed',
+      in_progress: 'CI checks are running',
+      other: 'CI checks in an unknown or mixed state',
+    };
+
+    // Combine GHA + AzDO summaries into a single worst-wins state.
+    function overallCiState(gha, azdo) {
+      const states = [];
+      if (gha?.hasAny)  states.push(gha.summary.overall);
+      if (azdo?.hasAny) states.push(azdo.summary.overall);
+      if (!states.length) return null;
+      if (states.includes('failure'))     return 'failure';
+      if (states.includes('in_progress')) return 'in_progress';
+      if (states.includes('other'))       return 'other';
+      return 'success';
+    }
+
+    // Build a PR row that's collapsible when CI is present. Default-open unless
+    // every check has passed.
+    function renderPrRow({ headerHtml, titleHtml, metaHtml, gha, azdo }) {
+      const overall = overallCiState(gha, azdo);
+      const overallDot = overall
+        ? \`<span class="ci-dot \${overall} overall" title="\${esc(overallCiTooltips[overall] ?? '')}"></span>\`
+        : '';
+      const head = \`<div class="row-head">\${headerHtml}\${overallDot}</div>\`;
+      const title = \`<div class="row-title">\${titleHtml}</div>\`;
+      const meta = metaHtml ? \`<div class="row-meta">\${metaHtml}</div>\` : '';
+      if (!overall) {
+        return \`<li class="row">\${head}\${title}\${meta}</li>\`;
+      }
+      const openAttr = overall === 'success' ? '' : 'open';
+      const body = \`\${renderGha(gha)}\${renderAzdo(azdo)}\`;
+      return \`<li class="row row-collapsible"><details \${openAttr}>
+        <summary>
+          <span class="caret">▶</span>
+          <div class="row-summary-content">\${head}\${title}\${meta}</div>
+        </summary>
+        <div class="row-body">\${body}</div>
+      </details></li>\`;
+    }
+
     function renderCopilot(rows) {
-      if (!rows.length) return '<div class="empty">No active Copilot sessions.</div>';
+      if (!rows.length) return '<div class="empty">No active Copilot sessions with PRs.</div>';
       return '<ul class="list">' + rows.map(s => {
-        const isPr  = s.source_pr_number || s.created_pr_number;
-        const isIss = !isPr && s.source_issue_number;
-        const num   = s.source_pr_number ?? s.created_pr_number ?? s.source_issue_number;
-        const url   = s.source_pr_html_url ?? s.created_pr_html_url ?? (s.issue_repo && s.source_issue_number ? \`https://github.com/\${s.issue_repo}/issues/\${s.source_issue_number}\` : null);
-        const repo  = s.repo_full_name ?? s.created_pr_repo ?? s.issue_repo ?? '(unknown repo)';
-        const title = s.source_pr_title ?? s.workspace_name ?? '(untitled)';
+        const num   = s.source_pr_number ?? s.created_pr_number;
+        const url   = s.source_pr_html_url ?? s.created_pr_html_url;
+        const repo  = s.repo_full_name ?? s.created_pr_repo ?? '(unknown repo)';
+        const title = s._liveTitle ?? s.source_pr_title ?? s.workspace_name ?? '(untitled)';
         const head  = s.source_pr_head_ref ? \`\${esc(s.source_pr_head_ref)} → \${esc(s.source_pr_base_ref ?? '')}\` : esc(s.branch ?? '');
-        const author = s.source_pr_author_login ? \`by \${esc(s.source_pr_author_login)}\` : '';
-        const typeBadge = isPr ? '<span class="badge pr">PR</span>' : isIss ? '<span class="badge issue">Issue</span>' : '';
-        const stateBadge = s.source_pr_state ? \`<span class="badge \${esc(s.source_pr_state)}">\${esc(s.source_pr_state)}</span>\` : '';
-        const syncBadge  = s.sync_state ? \`<span class="badge sync-\${esc(s.sync_state)}">\${esc(s.sync_state.replace(/_/g,' '))}</span>\` : '';
+        const draftBadge = s._liveDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
+        const syncBadge  = s.sync_state ? \`<span class="badge sync-\${esc(s.sync_state)}" title="\${esc(syncTooltips[s.sync_state] ?? '')}">\${esc(s.sync_state.replace(/_/g,' '))}</span>\` : '';
         const link = url ? \`<a href="\${esc(url)}" target="_blank" rel="noopener">#\${esc(num)}</a>\` : (num ? \`#\${esc(num)}\` : '');
-        const project = s.project_name ? \`<span class="project">\${esc(s.project_name)}</span>\` : '';
-        return \`<li class="row">
-          <div class="row-head">\${project}<span class="repo">\${esc(repo)}</span>\${link}\${typeBadge}\${stateBadge}\${syncBadge}</div>
-          <div class="row-title">\${esc(title)}</div>
-          <div class="row-meta">\${head} \${author}</div>
-        </li>\`;
+        const sessionInfo = s._taskUrl
+          ? \`<a class="badge session" href="\${esc(s._taskUrl)}" target="_blank" rel="noopener" title="Open this session on github.com">session ↗</a>\`
+          : (s.workspace_id ? \`<span class="badge session" title="Workspace ID: \${esc(s.workspace_id)}">session</span>\` : '');
+        const updated = s._liveUpdatedAt ? \`updated \${new Date(s._liveUpdatedAt).toLocaleString()}\` : '';
+        const meta = [head, updated].filter(Boolean).join(' · ');
+        return renderPrRow({
+          headerHtml: \`<span class="repo">\${esc(repo)}</span>\${link}\${draftBadge}\${syncBadge}\${sessionInfo}\`,
+          titleHtml: esc(title),
+          metaHtml: '',
+          gha: s._gha,
+          azdo: s._azdo,
+        });
       }).join('') + '</ul>';
     }
 
@@ -425,25 +606,60 @@ const PAGE_HTML = `<!doctype html>
       </div>\`;
     }
 
-    function renderAll(prs, sessionKeys) {
+    function renderGha(gha) {
+      if (!gha || !gha.hasAny) return '';
+      const s = gha.summary;
+      const overallDot = '<span class="ci-dot ' + s.overall + '"></span>';
+      const counts = [
+        s.success     ? \`<span title="passed">✓ \${s.success}</span>\` : '',
+        s.failure     ? \`<span title="failed" style="color:#f85149">✕ \${s.failure}</span>\` : '',
+        s.inProgress  ? \`<span title="in progress" style="color:#d29922">⟳ \${s.inProgress}</span>\` : '',
+        s.other       ? \`<span title="other">· \${s.other}</span>\` : '',
+      ].filter(Boolean).join(' ');
+      const workflowLines = gha.workflows.map(w => {
+        const label = w.url
+          ? \`<a href="\${esc(w.url)}" target="_blank" rel="noopener">\${esc(w.name)}</a>\`
+          : esc(w.name);
+        const jobs = w.runs.map(r => \`<li><span class="ci-dot \${runDotClass(r)}"></span><a href="\${esc(r.detailsUrl)}" target="_blank" rel="noopener">\${esc(r.name)}</a> <span class="label">\${esc(runStatusLabel(r))}</span></li>\`).join('');
+        return \`<div class="azdo-build">
+          <div class="azdo-line">\${label} <span class="label">· \${w.runs.length} job\${w.runs.length === 1 ? '' : 's'}</span></div>
+          <details class="azdo-jobs"><summary>show jobs</summary><ul>\${jobs}</ul></details>
+        </div>\`;
+      }).join('');
+      return \`<div class="azdo">
+        <div class="azdo-line">\${overallDot}<strong>GitHub Actions</strong> <span class="label">\${counts}</span></div>
+        \${workflowLines}
+      </div>\`;
+    }
+
+    function renderAll(prs, sessionIndex) {
       if (!prs.length) return '<div class="empty">No open PRs authored by you.</div>';
       return '<ul class="list">' + prs.map(p => {
         const repo = p.repository.nameWithOwner;
         const key  = (repo + '#' + p.number).toLowerCase();
-        const hasSession = sessionKeys.has(key);
-        const draft = p.isDraft ? '<span class="badge draft">draft</span>' : '';
-        const session = hasSession ? '<span class="badge session" title="A Copilot session is open for this PR">in session</span>' : '';
+        const session = sessionIndex.get(key);
+        const draft = p.isDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
+        const sessionBadge = session
+          ? (session._taskUrl
+              ? \`<a class="badge session" href="\${esc(session._taskUrl)}" target="_blank" rel="noopener" title="Open this session on github.com">session ↗</a>\`
+              : \`<span class="badge session" title="A Copilot session is open for this PR (workspace \${esc(session.workspace_id)})">session</span>\`)
+          : '';
+        const syncBadge = session?.sync_state ? \`<span class="badge sync-\${esc(session.sync_state)}" title="\${esc(syncTooltips[session.sync_state] ?? '')}">\${esc(session.sync_state.replace(/_/g,' '))}</span>\` : '';
+        const head = session?.source_pr_head_ref ? \`\${esc(session.source_pr_head_ref)} → \${esc(session.source_pr_base_ref ?? '')}\` : '';
         const updated = new Date(p.updatedAt).toLocaleString();
-        return \`<li class="row">
-          <div class="row-head"><span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${session}</div>
-          <div class="row-title">\${esc(p.title)}</div>
-          <div class="row-meta">updated \${esc(updated)}</div>
-          \${renderAzdo(p.azdo)}
-        </li>\`;
+        const meta = [head, \`updated \${updated}\`].filter(Boolean).join(' · ');
+        return renderPrRow({
+          headerHtml: \`<span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${syncBadge}\${sessionBadge}\`,
+          titleHtml: esc(p.title),
+          metaHtml: '',
+          gha: p.gha,
+          azdo: p.azdo,
+        });
       }).join('') + '</ul>';
     }
 
     let lastSessions = [];
+    let lastChecks = [];
 
     async function loadCopilot() {
       const res = await fetch('/api/sessions').then(r => r.json());
@@ -454,22 +670,49 @@ const PAGE_HTML = `<!doctype html>
         return;
       }
       lastSessions = res.rows;
-      document.getElementById('panel-copilot').innerHTML = renderCopilot(res.rows);
+      // Cross-reference CI data from the checks cache and task URLs from the tasks API
+      const [checksRes, tasksRes] = await Promise.all([
+        fetch('/api/prs-with-checks').then(r => r.json()),
+        fetch('/api/tasks').then(r => r.json()),
+      ]);
+      lastChecks = checksRes.rows ?? [];
+      const ciIndex = new Map();
+      for (const p of lastChecks) {
+        const key = (p.repository.nameWithOwner + '#' + p.number).toLowerCase();
+        ciIndex.set(key, p);
+      }
+      const taskMap = new Map(Object.entries(tasksRes.tasks ?? {}));
+      // Attach CI data and remote task URL to each session row
+      const enriched = res.rows.map(s => {
+        const prNum = s.source_pr_number ?? s.created_pr_number;
+        const repo = s.repo_full_name ?? s.created_pr_repo;
+        const key = repo && prNum ? (repo + '#' + prNum).toLowerCase() : null;
+        const ci = key ? ciIndex.get(key) : null;
+        const taskId = s.session_id ? taskMap.get(s.session_id) : null;
+        const taskUrl = taskId && repo ? \`https://github.com/\${repo}/tasks/\${taskId}\` : null;
+        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null, _liveTitle: ci?.title ?? null, _liveUpdatedAt: ci?.updatedAt ?? null, _liveDraft: ci?.isDraft ?? false, _taskUrl: taskUrl };
+      });
+      // Stash the task map on the session rows for renderAll cross-reference
+      window.__taskMap = taskMap;
+      document.getElementById('panel-copilot').innerHTML = renderCopilot(enriched);
       document.getElementById('copilot-count').textContent = ' (' + res.rows.length + ')';
     }
 
     async function loadAll(force=false) {
       const res = await fetch('/api/prs-with-checks' + (force ? '?force=1' : '')).then(r => r.json());
-      const sessionKeys = new Set();
+      const sessionIndex = new Map();
+      const taskMap = window.__taskMap ?? new Map();
       for (const s of lastSessions) {
-        if (s.repo_full_name && s.source_pr_number)  sessionKeys.add((s.repo_full_name + '#' + s.source_pr_number).toLowerCase());
-        if (s.created_pr_repo && s.created_pr_number) sessionKeys.add((s.created_pr_repo + '#' + s.created_pr_number).toLowerCase());
+        const taskId = s.session_id ? taskMap.get(s.session_id) : null;
+        const repoForTask = s.repo_full_name ?? s.created_pr_repo;
+        const taskUrl = taskId && repoForTask ? \`https://github.com/\${repoForTask}/tasks/\${taskId}\` : null;
+        const enriched = { ...s, _taskUrl: taskUrl };
+        if (s.repo_full_name && s.source_pr_number)  sessionIndex.set((s.repo_full_name + '#' + s.source_pr_number).toLowerCase(), enriched);
+        if (s.created_pr_repo && s.created_pr_number) sessionIndex.set((s.created_pr_repo + '#' + s.created_pr_number).toLowerCase(), enriched);
       }
       const errorBanner = res.error ? \`<div class="error">\${esc(res.error)}</div>\` : '';
-      document.getElementById('panel-all').innerHTML = errorBanner + renderAll(res.rows ?? [], sessionKeys);
+      document.getElementById('panel-all').innerHTML = errorBanner + renderAll(res.rows ?? [], sessionIndex);
       document.getElementById('all-count').textContent = res.rows ? ' (' + res.rows.length + ')' : '';
-      const ageSec = res.cachedAt ? Math.round((Date.now() - res.cachedAt) / 1000) : null;
-      document.getElementById('footer').textContent = ageSec != null ? \`PR + CI data \${ageSec}s old\` : '';
     }
 
     document.querySelectorAll('.tab').forEach(btn => {
@@ -514,6 +757,12 @@ async function startServer() {
                 const force = url.searchParams.get("force") === "1";
                 const { data, cachedAt, error } = await fetchPrsWithChecks({ force });
                 jsonResponse(res, { rows: data ?? [], cachedAt, error });
+            } else if (url.pathname === "/api/tasks") {
+                const force = url.searchParams.get("force") === "1";
+                const { data, cachedAt, error } = await fetchAgentTasks({ force });
+                // Serialize Map as plain object for JSON
+                const tasks = data ? Object.fromEntries(data) : {};
+                jsonResponse(res, { tasks, cachedAt, error });
             } else {
                 res.statusCode = 404;
                 res.end("not found");
@@ -547,6 +796,7 @@ const session = await joinSession({
                             sessionCount: Array.isArray(sessions) ? sessions.length : 0,
                             prCount: checks.data?.length ?? 0,
                             azdoBuilds: (checks.data ?? []).reduce((n, p) => n + (p.azdo?.builds?.length ?? 0), 0),
+                            ghaWorkflows: (checks.data ?? []).reduce((n, p) => n + (p.gha?.workflows?.length ?? 0), 0),
                             errors: [sessions?.__error, checks.error].filter(Boolean),
                         };
                     },
@@ -573,4 +823,4 @@ const session = await joinSession({
     ],
 });
 
-await session.log("pr-pipelines extension ready (v0.2)");
+await session.log("pr-pipelines extension ready (v0.3)");
