@@ -438,6 +438,8 @@ const PAGE_HTML = `<!doctype html>
           <div class="row-head">\${project}<span class="repo">\${esc(repo)}</span>\${link}\${typeBadge}\${stateBadge}\${syncBadge}</div>
           <div class="row-title">\${esc(title)}</div>
           <div class="row-meta">\${head} \${author}</div>
+          \${renderGha(s._gha)}
+          \${renderAzdo(s._azdo)}
         </li>\`;
       }).join('') + '</ul>';
     }
@@ -524,6 +526,7 @@ const PAGE_HTML = `<!doctype html>
     }
 
     let lastSessions = [];
+    let lastChecks = [];
 
     async function loadCopilot() {
       const res = await fetch('/api/sessions').then(r => r.json());
@@ -534,7 +537,23 @@ const PAGE_HTML = `<!doctype html>
         return;
       }
       lastSessions = res.rows;
-      document.getElementById('panel-copilot').innerHTML = renderCopilot(res.rows);
+      // Cross-reference CI data from the checks cache
+      const checksRes = await fetch('/api/prs-with-checks').then(r => r.json());
+      lastChecks = checksRes.rows ?? [];
+      const ciIndex = new Map();
+      for (const p of lastChecks) {
+        const key = (p.repository.nameWithOwner + '#' + p.number).toLowerCase();
+        ciIndex.set(key, p);
+      }
+      // Attach CI data to each session row
+      const enriched = res.rows.map(s => {
+        const prNum = s.source_pr_number ?? s.created_pr_number;
+        const repo = s.repo_full_name ?? s.created_pr_repo;
+        const key = repo && prNum ? (repo + '#' + prNum).toLowerCase() : null;
+        const ci = key ? ciIndex.get(key) : null;
+        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null };
+      });
+      document.getElementById('panel-copilot').innerHTML = renderCopilot(enriched);
       document.getElementById('copilot-count').textContent = ' (' + res.rows.length + ')';
     }
 
