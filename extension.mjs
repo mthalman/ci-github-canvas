@@ -5,7 +5,7 @@
 //                       their PR or issue origin. Source: ~/.copilot/data.db.
 //   2. "All PRs" tab  - every open PR the user authored across all of GitHub.
 //                       Source: `gh search prs --author=@me --state=open`.
-// Cross-link: PRs that appear in both tabs get a "in session" badge in tab 2.
+// Cross-link: PRs that appear in both tabs get a "session" badge in tab 2.
 //
 // CI status: shows both Azure Pipelines and GitHub Actions workflow runs.
 //
@@ -580,8 +580,8 @@ const PAGE_HTML = `<!doctype html>
         const draft = p.isDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
         const sessionBadge = session
           ? (session._taskUrl
-              ? \`<a class="badge session" href="\${esc(session._taskUrl)}" target="_blank" rel="noopener" title="Open this session on github.com">in session ↗</a>\`
-              : \`<span class="badge session" title="A Copilot session is open for this PR (workspace \${esc(session.workspace_id)})">in session</span>\`)
+              ? \`<a class="badge session" href="\${esc(session._taskUrl)}" target="_blank" rel="noopener" title="Open this session on github.com">session ↗</a>\`
+              : \`<span class="badge session" title="A Copilot session is open for this PR (workspace \${esc(session.workspace_id)})">session</span>\`)
           : '';
         const syncBadge = session?.sync_state ? \`<span class="badge sync-\${esc(session.sync_state)}" title="\${esc(syncTooltips[session.sync_state] ?? '')}">\${esc(session.sync_state.replace(/_/g,' '))}</span>\` : '';
         const head = session?.source_pr_head_ref ? \`\${esc(session.source_pr_head_ref)} → \${esc(session.source_pr_base_ref ?? '')}\` : '';
