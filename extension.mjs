@@ -453,6 +453,26 @@ const PAGE_HTML = `<!doctype html>
     details.azdo-jobs summary { cursor: pointer; font-size: 0.75rem; color: #888; list-style: revert; }
     details.azdo-jobs ul { list-style: none; padding-left: 1rem; margin: 0.25rem 0 0; }
     details.azdo-jobs li { font-size: 0.75rem; font-family: ui-monospace, Consolas, monospace; padding: 0.1rem 0; display: flex; gap: 0.4rem; align-items: center; }
+
+    /* Collapsible PR rows. Default-open unless every CI check passed. */
+    li.row-collapsible { padding: 0; }
+    li.row-collapsible > details > summary {
+      cursor: pointer; list-style: none;
+      padding: 0.6rem 0.75rem;
+      display: flex; gap: 0.5rem; align-items: flex-start;
+    }
+    li.row-collapsible > details > summary::-webkit-details-marker { display: none; }
+    li.row-collapsible > details > summary::marker { content: ''; }
+    li.row-collapsible .caret {
+      flex: 0 0 auto; color: #888; font-size: 0.7rem; line-height: 1.5;
+      transition: transform 0.15s ease;
+      transform: rotate(0deg);
+      width: 0.7rem;
+    }
+    li.row-collapsible > details[open] > summary .caret { transform: rotate(90deg); }
+    li.row-collapsible .row-summary-content { flex: 1 1 auto; min-width: 0; }
+    li.row-collapsible > details > .row-body { padding: 0 0.75rem 0.6rem 1.95rem; }
+    li.row-collapsible .ci-dot.overall { width: 0.7rem; height: 0.7rem; margin-left: auto; }
     a { color: #1f6feb; text-decoration: none; }
     a:hover { text-decoration: underline; }
     .empty, .error, .loading { color: #888; padding: 1rem; text-align: center; }
@@ -483,6 +503,49 @@ const PAGE_HTML = `<!doctype html>
       'diverged': 'Local and remote have diverged with different commits',
     };
 
+    const overallCiTooltips = {
+      success: 'All CI checks passed',
+      failure: 'One or more CI checks failed',
+      in_progress: 'CI checks are running',
+      other: 'CI checks in an unknown or mixed state',
+    };
+
+    // Combine GHA + AzDO summaries into a single worst-wins state.
+    function overallCiState(gha, azdo) {
+      const states = [];
+      if (gha?.hasAny)  states.push(gha.summary.overall);
+      if (azdo?.hasAny) states.push(azdo.summary.overall);
+      if (!states.length) return null;
+      if (states.includes('failure'))     return 'failure';
+      if (states.includes('in_progress')) return 'in_progress';
+      if (states.includes('other'))       return 'other';
+      return 'success';
+    }
+
+    // Build a PR row that's collapsible when CI is present. Default-open unless
+    // every check has passed.
+    function renderPrRow({ headerHtml, titleHtml, metaHtml, gha, azdo }) {
+      const overall = overallCiState(gha, azdo);
+      const overallDot = overall
+        ? \`<span class="ci-dot \${overall} overall" title="\${esc(overallCiTooltips[overall] ?? '')}"></span>\`
+        : '';
+      const head = \`<div class="row-head">\${headerHtml}\${overallDot}</div>\`;
+      const title = \`<div class="row-title">\${titleHtml}</div>\`;
+      const meta = metaHtml ? \`<div class="row-meta">\${metaHtml}</div>\` : '';
+      if (!overall) {
+        return \`<li class="row">\${head}\${title}\${meta}</li>\`;
+      }
+      const openAttr = overall === 'success' ? '' : 'open';
+      const body = \`\${renderGha(gha)}\${renderAzdo(azdo)}\`;
+      return \`<li class="row row-collapsible"><details \${openAttr}>
+        <summary>
+          <span class="caret">▶</span>
+          <div class="row-summary-content">\${head}\${title}\${meta}</div>
+        </summary>
+        <div class="row-body">\${body}</div>
+      </details></li>\`;
+    }
+
     function renderCopilot(rows) {
       if (!rows.length) return '<div class="empty">No active Copilot sessions with PRs.</div>';
       return '<ul class="list">' + rows.map(s => {
@@ -499,13 +562,13 @@ const PAGE_HTML = `<!doctype html>
           : (s.workspace_id ? \`<span class="badge session" title="Workspace ID: \${esc(s.workspace_id)}">session</span>\` : '');
         const updated = s._liveUpdatedAt ? \`updated \${new Date(s._liveUpdatedAt).toLocaleString()}\` : '';
         const meta = [head, updated].filter(Boolean).join(' · ');
-        return \`<li class="row">
-          <div class="row-head"><span class="repo">\${esc(repo)}</span>\${link}\${draftBadge}\${syncBadge}\${sessionInfo}</div>
-          <div class="row-title">\${esc(title)}</div>
-          <div class="row-meta">\${meta}</div>
-          \${renderGha(s._gha)}
-          \${renderAzdo(s._azdo)}
-        </li>\`;
+        return renderPrRow({
+          headerHtml: \`<span class="repo">\${esc(repo)}</span>\${link}\${draftBadge}\${syncBadge}\${sessionInfo}\`,
+          titleHtml: esc(title),
+          metaHtml: meta,
+          gha: s._gha,
+          azdo: s._azdo,
+        });
       }).join('') + '</ul>';
     }
 
@@ -587,13 +650,13 @@ const PAGE_HTML = `<!doctype html>
         const head = session?.source_pr_head_ref ? \`\${esc(session.source_pr_head_ref)} → \${esc(session.source_pr_base_ref ?? '')}\` : '';
         const updated = new Date(p.updatedAt).toLocaleString();
         const meta = [head, \`updated \${updated}\`].filter(Boolean).join(' · ');
-        return \`<li class="row">
-          <div class="row-head"><span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${sessionBadge}\${syncBadge}</div>
-          <div class="row-title">\${esc(p.title)}</div>
-          <div class="row-meta">\${meta}</div>
-          \${renderGha(p.gha)}
-          \${renderAzdo(p.azdo)}
-        </li>\`;
+        return renderPrRow({
+          headerHtml: \`<span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${sessionBadge}\${syncBadge}\`,
+          titleHtml: esc(p.title),
+          metaHtml: meta,
+          gha: p.gha,
+          azdo: p.azdo,
+        });
       }).join('') + '</ul>';
     }
 
