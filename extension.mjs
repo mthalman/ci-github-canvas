@@ -565,12 +565,7 @@ const PAGE_HTML = `<!doctype html>
     details.azdo-jobs summary { cursor: pointer; font-size: 0.75rem; color: #888; list-style: revert; }
     details.azdo-jobs ul { list-style: none; padding-left: 1rem; margin: 0.25rem 0 0; }
     details.azdo-jobs li { font-size: 0.75rem; font-family: ui-monospace, Consolas, monospace; padding: 0.1rem 0; display: flex; gap: 0.4rem; align-items: center; }
-    .azdo-timeline { padding-left: 0.5rem; margin: 0.25rem 0 0; }
-    .azdo-timeline ul { list-style: none; padding-left: 1rem; margin: 0; border-left: 1px dashed color-mix(in srgb, currentColor 15%, transparent); }
-    .azdo-timeline li { font-size: 0.75rem; font-family: ui-monospace, Consolas, monospace; padding: 0.1rem 0; }
-    .azdo-timeline .tl-row { display: flex; gap: 0.4rem; align-items: center; }
-    .azdo-timeline .tl-type { color: #888; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.04em; min-width: 3.5rem; }
-    .azdo-timeline .tl-dur { color: #888; margin-left: auto; font-size: 0.7rem; }
+    .azdo-timeline { margin: 0.25rem 0 0; }
     .azdo-timeline .tl-fallback-note { color: #d29922; font-size: 0.7rem; padding: 0.2rem 0; }
     .azdo-timeline .tl-loading { color: #888; font-size: 0.75rem; padding: 0.2rem 0; }
     .azdo-timeline .tl-error { color: #f85149; font-size: 0.75rem; padding: 0.2rem 0; white-space: pre-wrap; }
@@ -927,65 +922,42 @@ const PAGE_HTML = `<!doctype html>
       if (state !== 'completed') return (state || 'pending').toLowerCase();
       return (result || 'unknown').toLowerCase();
     }
-    function tlDuration(startTime, finishTime) {
-      if (!startTime) return '';
-      const end = finishTime ? new Date(finishTime).getTime() : Date.now();
-      const ms = end - new Date(startTime).getTime();
-      if (!Number.isFinite(ms) || ms < 0) return '';
-      const s = Math.round(ms / 1000);
-      if (s < 60) return s + 's';
-      const m = Math.floor(s / 60);
-      const rem = s % 60;
-      if (m < 60) return rem ? \`\${m}m \${rem}s\` : \`\${m}m\`;
-      const h = Math.floor(m / 60);
-      return \`\${h}h \${m % 60}m\`;
-    }
 
-    function renderTimelineTree(records, summaryUrl) {
+    function renderTimelineJobs(records, summaryUrl) {
       if (!records || records.length === 0) {
         return '<div class="tl-loading">No timeline records yet — build may still be queuing.</div>';
       }
-      // Index by id and bucket by parentId. Records without a known parent
-      // are rendered as roots so we never silently drop anything.
-      const byId = new Map(records.map(r => [r.id, r]));
-      const childrenOf = new Map();
-      const roots = [];
-      for (const r of records) {
-        if (r.parentId && byId.has(r.parentId)) {
-          if (!childrenOf.has(r.parentId)) childrenOf.set(r.parentId, []);
-          childrenOf.get(r.parentId).push(r);
-        } else {
-          roots.push(r);
-        }
+      // AzDO timelines contain Stage / Phase / Job / Task / Checkpoint records.
+      // For parity with the GHA jobs list we only show Job records, flat, in
+      // execution order. Parent Stage/Phase context is dropped to keep the UI
+      // consistent across CI systems.
+      const jobs = records
+        .filter(r => r.type === 'Job')
+        .sort((a, b) => {
+          // Order by start time when present (most useful while a build runs),
+          // fall back to the timeline 'order' field, then name.
+          const ta = a.startTime ? new Date(a.startTime).getTime() : Infinity;
+          const tb = b.startTime ? new Date(b.startTime).getTime() : Infinity;
+          if (ta !== tb) return ta - tb;
+          return (a.order ?? 0) - (b.order ?? 0) || String(a.name).localeCompare(String(b.name));
+        });
+      if (jobs.length === 0) {
+        return '<div class="tl-loading">No job records yet — build may still be queuing.</div>';
       }
-      const sortByOrder = (a, b) => (a.order ?? 0) - (b.order ?? 0) || String(a.name).localeCompare(String(b.name));
-      roots.sort(sortByOrder);
-      for (const arr of childrenOf.values()) arr.sort(sortByOrder);
-
-      const baseLog = summaryUrl ? summaryUrl.replace(/&view=[^&]*/g, '').replace(/&j=[^&]*/g, '').replace(/&t=[^&]*/g, '') : null;
-      function renderNode(r) {
+      // Build the AzDO web logs URL from the build summary URL by stripping
+      // any pre-existing view/job query params we may have inherited.
+      const baseLog = summaryUrl
+        ? summaryUrl.replace(/&view=[^&]*/g, '').replace(/&j=[^&]*/g, '').replace(/&t=[^&]*/g, '')
+        : null;
+      return '<ul>' + jobs.map(r => {
         const dot = tlDotClass(r.state, r.result);
         const label = tlStatusLabel(r.state, r.result);
-        const dur = tlDuration(r.startTime, r.finishTime);
-        // Link record names back to the AzDO build UI (not the REST log URL,
-        // which requires auth and renders as raw JSON in the browser).
-        const linkHref = baseLog ? \`\${baseLog}&view=logs&j=\${encodeURIComponent(r.id)}\` : null;
-        const nameHtml = linkHref
-          ? \`<a href="\${esc(linkHref)}" target="_blank" rel="noopener">\${esc(r.name)}</a>\`
+        const href = baseLog ? \`\${baseLog}&view=logs&j=\${encodeURIComponent(r.id)}\` : null;
+        const nameHtml = href
+          ? \`<a href="\${esc(href)}" target="_blank" rel="noopener">\${esc(r.name)}</a>\`
           : esc(r.name);
-        const kids = childrenOf.get(r.id);
-        return \`<li>
-          <div class="tl-row">
-            <span class="ci-dot \${dot}"></span>
-            <span class="tl-type">\${esc(r.type || '')}</span>
-            \${nameHtml}
-            <span class="label">\${esc(label)}</span>
-            \${dur ? \`<span class="tl-dur">\${esc(dur)}</span>\` : ''}
-          </div>
-          \${kids && kids.length ? \`<ul>\${kids.map(renderNode).join('')}</ul>\` : ''}
-        </li>\`;
-      }
-      return \`<ul>\${roots.map(renderNode).join('')}</ul>\`;
+        return \`<li><span class="ci-dot \${dot}"></span>\${nameHtml} <span class="label">\${esc(label)}</span></li>\`;
+      }).join('') + '</ul>';
     }
 
     // Per-details guard to avoid overlapping requests for the same panel.
@@ -1024,7 +996,7 @@ const PAGE_HTML = `<!doctype html>
             <div class="tl-fallback-note">Showing GitHub check-run jobs instead:</div>
             \${content.dataset.fallbackHtml}\`;
         } else {
-          wrapper.innerHTML = renderTimelineTree(res.data.records, summaryUrl);
+          wrapper.innerHTML = renderTimelineJobs(res.data.records, summaryUrl);
           detailsEl.dataset.tlLoaded = '1';
         }
       } catch (e) {
