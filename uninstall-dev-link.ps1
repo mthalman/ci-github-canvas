@@ -1,0 +1,47 @@
+<#
+.SYNOPSIS
+    Removes the dev-link symlink created by install-dev-link.ps1.
+
+.PARAMETER Name
+    Folder name under the Copilot extensions directory to remove. Defaults to
+    'pr-pipelines' to match install-dev-link.ps1.
+
+.EXAMPLE
+    pwsh .\uninstall-dev-link.ps1
+#>
+[CmdletBinding()]
+param(
+    [string] $Name = 'pr-pipelines'
+)
+
+$ErrorActionPreference = 'Stop'
+
+$targetDir = Join-Path $env:USERPROFILE ".copilot\extensions\$Name"
+
+if (-not (Test-Path $targetDir)) {
+    Write-Host "Nothing to remove at $targetDir"
+    exit 0
+}
+
+# Refuse to remove if the folder contains anything we didn't put there —
+# we only want to clean up our own dev link, not nuke a hand-installed copy.
+$entries = Get-ChildItem -Force $targetDir
+$ourFile = Join-Path $targetDir 'extension.mjs'
+$onlyOurs =
+    $entries.Count -eq 1 -and
+    $entries[0].FullName -eq $ourFile -and
+    $entries[0].LinkType -in @('SymbolicLink', 'Junction')
+
+if (-not $onlyOurs) {
+    Write-Error @"
+Refusing to remove $targetDir — it contains files other than the dev-link symlink
+(or extension.mjs is a regular file, not a symlink).
+
+Remove it manually if you're sure:
+  Remove-Item -Recurse -Force '$targetDir'
+"@
+    exit 1
+}
+
+Remove-Item -Recurse -Force $targetDir
+Write-Host "Removed $targetDir" -ForegroundColor Green

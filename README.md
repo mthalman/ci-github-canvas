@@ -41,6 +41,30 @@ install_extension({
 })
 ```
 
+## Local development
+
+If you're hacking on this extension, the copy-on-every-change loop above gets
+annoying fast. Use the dev-link script instead — it creates a symlink from the
+Copilot extensions directory back to this repo so your edits are picked up by
+the next `extensions_reload` (or session restart):
+
+```powershell
+pwsh .\install-dev-link.ps1
+```
+
+Edit `extension.mjs` in the repo, then ask the agent to **reload extensions**.
+No file copy step.
+
+To remove the symlink:
+
+```powershell
+pwsh .\uninstall-dev-link.ps1
+```
+
+> **Windows note:** creating symbolic links without elevation requires
+> Developer Mode (Settings &rarr; For developers). Without it, run the install
+> script from an elevated PowerShell prompt.
+
 ## Usage
 
 Ask the agent something like:
