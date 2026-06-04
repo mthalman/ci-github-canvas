@@ -642,8 +642,10 @@ const PAGE_HTML = `<!doctype html>
     }
 
     // Build a PR row that's collapsible when CI is present. Default-open unless
-    // every check has passed.
-    function renderPrRow({ headerHtml, titleHtml, metaHtml, gha, azdo }) {
+    // every check has passed. prKey (e.g. owner/repo#123) gives the details
+    // element a stable identity so open/closed state survives auto-refresh
+    // re-renders via snapshotPrRowState/restorePrRowState.
+    function renderPrRow({ headerHtml, titleHtml, metaHtml, gha, azdo, prKey }) {
       const overall = overallCiState(gha, azdo);
       const overallDot = overall
         ? \`<span class="ci-dot \${overall} overall" title="\${esc(overallCiTooltips[overall] ?? '')}"></span>\`
@@ -655,8 +657,9 @@ const PAGE_HTML = `<!doctype html>
         return \`<li class="row">\${head}\${title}\${meta}</li>\`;
       }
       const openAttr = overall === 'success' ? '' : 'open';
+      const keyAttr = prKey ? \` data-pr-key="\${esc(prKey)}"\` : '';
       const body = \`\${renderGha(gha)}\${renderAzdo(azdo)}\`;
-      return \`<li class="row row-collapsible"><details \${openAttr}>
+      return \`<li class="row row-collapsible"><details\${keyAttr} \${openAttr}>
         <summary>
           <span class="caret">▶</span>
           <div class="row-summary-content">\${head}\${title}\${meta}</div>
@@ -681,12 +684,14 @@ const PAGE_HTML = `<!doctype html>
           : (s.workspace_id ? \`<span class="badge session" title="Workspace ID: \${esc(s.workspace_id)}">session</span>\` : '');
         const updated = s._liveUpdatedAt ? \`updated \${new Date(s._liveUpdatedAt).toLocaleString()}\` : '';
         const meta = [head, updated].filter(Boolean).join(' · ');
+        const prKey = repo && num ? (repo + '#' + num).toLowerCase() : null;
         return renderPrRow({
           headerHtml: \`<span class="repo">\${esc(repo)}</span>\${link}\${draftBadge}\${syncBadge}\${sessionInfo}\`,
           titleHtml: esc(title),
           metaHtml: '',
           gha: s._gha,
           azdo: s._azdo,
+          prKey,
         });
       }).join('') + '</ul>';
     }
@@ -784,6 +789,7 @@ const PAGE_HTML = `<!doctype html>
           metaHtml: '',
           gha: p.gha,
           azdo: p.azdo,
+          prKey: key,
         });
       }).join('') + '</ul>';
     }
@@ -825,7 +831,9 @@ const PAGE_HTML = `<!doctype html>
       // Stash the task map on the session rows for renderAll cross-reference
       window.__taskMap = taskMap;
       const openTimelines = snapshotOpenAzdoTimelines();
+      const prRowState = snapshotPrRowState();
       document.getElementById('panel-copilot').innerHTML = renderCopilot(enriched);
+      restorePrRowState(prRowState);
       restoreOpenAzdoTimelines(openTimelines);
       document.getElementById('copilot-count').textContent = ' (' + res.rows.length + ')';
     }
@@ -844,7 +852,9 @@ const PAGE_HTML = `<!doctype html>
       }
       const errorBanner = res.error ? \`<div class="error">\${esc(res.error)}</div>\` : '';
       const openTimelines = snapshotOpenAzdoTimelines();
+      const prRowState = snapshotPrRowState();
       document.getElementById('panel-all').innerHTML = errorBanner + renderAll(res.rows ?? [], sessionIndex);
+      restorePrRowState(prRowState);
       restoreOpenAzdoTimelines(openTimelines);
       const visibleCount = (res.rows ?? []).filter(p => p.azdo?.hasAny || p.gha?.hasAny).length;
       document.getElementById('all-count').textContent = res.rows ? ' (' + visibleCount + ')' : '';
@@ -885,6 +895,25 @@ const PAGE_HTML = `<!doctype html>
           d.open = true;
           loadAzdoTimeline(d, { force: true });
         }
+      });
+    }
+
+    // Snapshot/restore the open/closed state of every PR-row <details> by key.
+    // Without this, the 60s auto-refresh (and the manual Refresh button) wipes
+    // the user's manual collapse/expand and forces every row back to the
+    // default-open-unless-all-checks-passed state.
+    function snapshotPrRowState() {
+      const state = new Map();
+      document.querySelectorAll('details[data-pr-key]').forEach(d => {
+        state.set(d.dataset.prKey, d.open);
+      });
+      return state;
+    }
+
+    function restorePrRowState(state) {
+      if (!state || state.size === 0) return;
+      document.querySelectorAll('details[data-pr-key]').forEach(d => {
+        if (state.has(d.dataset.prKey)) d.open = state.get(d.dataset.prKey);
       });
     }
 
