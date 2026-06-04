@@ -440,55 +440,44 @@ function summarizeAzdoRuns(runs) {
     };
 }
 
-// Reduce non-AzDO check runs into GitHub Actions workflow buckets, grouped by workflow name.
-// Returns { workflows: [...], summary: { total, success, failure, inProgress, ... }, hasAny }.
+// Flatten non-AzDO check runs into a single list. Each GHA check run becomes
+// one row; we used to group by workflow name (the part before " / " in the
+// check name) but that produced spurious parent/child cards for GitHub App
+// checks like "license/cla" whose name happens to contain "/".
+// Returns { runs: [...], summary: {...}, hasAny }.
 function summarizeGhaRuns(runs) {
     const ghaRuns = runs.filter((r) => r?.detailsUrl && !AZDO_URL_RE.test(r.detailsUrl));
     if (ghaRuns.length === 0) {
-        return { hasAny: false, workflows: [], summary: null };
+        return { hasAny: false, runs: [], summary: null };
     }
-    // Group by workflow name (the part before the " / " separator in the check run name).
-    const workflows = new Map();
-    for (const r of ghaRuns) {
-        const parts = r.name.split(" / ");
-        const workflowName = parts.length > 1 ? parts[0] : r.name;
-        let entry = workflows.get(workflowName);
-        if (!entry) {
-            // Derive workflow URL from detailsUrl (strip job-specific path segments)
-            const workflowUrl = r.detailsUrl
-                ? r.detailsUrl.replace(/\/job\/[^?#]*/, "")
-                : null;
-            entry = { name: workflowName, url: workflowUrl, runs: [] };
-            workflows.set(workflowName, entry);
-        }
-        entry.runs.push({
+    const summary = { total: 0, success: 0, failure: 0, inProgress: 0, other: 0 };
+    const shaped = ghaRuns.map((r) => {
+        summary.total++;
+        if (r.status !== "COMPLETED") summary.inProgress++;
+        else if (r.conclusion === "SUCCESS" || r.conclusion === "NEUTRAL" || r.conclusion === "SKIPPED") summary.success++;
+        else if (r.conclusion === "FAILURE" || r.conclusion === "TIMED_OUT" || r.conclusion === "STARTUP_FAILURE" || r.conclusion === "ACTION_REQUIRED") summary.failure++;
+        else summary.other++;
+        return {
             name: r.name,
             status: r.status,
             conclusion: r.conclusion,
             detailsUrl: r.detailsUrl,
             startedAt: r.startedAt,
             completedAt: r.completedAt,
-        });
-    }
-    const summary = { total: 0, success: 0, failure: 0, inProgress: 0, other: 0 };
-    for (const w of workflows.values()) {
-        for (const r of w.runs) {
-            summary.total++;
-            if (r.status !== "COMPLETED") summary.inProgress++;
-            else if (r.conclusion === "SUCCESS" || r.conclusion === "NEUTRAL" || r.conclusion === "SKIPPED") summary.success++;
-            else if (r.conclusion === "FAILURE" || r.conclusion === "TIMED_OUT" || r.conclusion === "STARTUP_FAILURE" || r.conclusion === "ACTION_REQUIRED") summary.failure++;
-            else summary.other++;
-        }
-    }
+        };
+    });
     summary.overall =
         summary.failure > 0 ? "failure" :
         summary.inProgress > 0 ? "in_progress" :
         summary.success > 0 ? "success" : "other";
-    return {
-        hasAny: true,
-        workflows: [...workflows.values()].sort((a, b) => a.name.localeCompare(b.name)),
-        summary,
-    };
+    // Sort by start time for parity with AzDO job ordering.
+    shaped.sort((a, b) => {
+        const ta = a.startedAt ? new Date(a.startedAt).getTime() : Infinity;
+        const tb = b.startedAt ? new Date(b.startedAt).getTime() : Infinity;
+        if (ta !== tb) return ta - tb;
+        return String(a.name).localeCompare(String(b.name));
+    });
+    return { hasAny: true, runs: shaped, summary };
 }
 
 // Build a quick lookup key for cross-referencing tab 2 against tab 1.
@@ -745,19 +734,10 @@ const PAGE_HTML = `<!doctype html>
         s.inProgress  ? \`<span title="in progress" style="color:#d29922">⟳ \${s.inProgress}</span>\` : '',
         s.other       ? \`<span title="other">· \${s.other}</span>\` : '',
       ].filter(Boolean).join(' ');
-      const workflowLines = gha.workflows.map(w => {
-        const label = w.url
-          ? \`<a href="\${esc(w.url)}" target="_blank" rel="noopener">\${esc(w.name)}</a>\`
-          : esc(w.name);
-        const jobs = w.runs.map(r => \`<li><span class="ci-dot \${runDotClass(r)}"></span><a href="\${esc(r.detailsUrl)}" target="_blank" rel="noopener">\${esc(r.name)}</a> <span class="label">\${esc(runStatusLabel(r))}</span></li>\`).join('');
-        return \`<div class="azdo-build">
-          <div class="azdo-line">\${label} <span class="label">· \${w.runs.length} job\${w.runs.length === 1 ? '' : 's'}</span></div>
-          <details class="azdo-jobs"><summary>show jobs</summary><ul>\${jobs}</ul></details>
-        </div>\`;
-      }).join('');
+      const jobs = gha.runs.map(r => \`<li><span class="ci-dot \${runDotClass(r)}"></span><a href="\${esc(r.detailsUrl)}" target="_blank" rel="noopener">\${esc(r.name)}</a> <span class="label">\${esc(runStatusLabel(r))}</span></li>\`).join('');
       return \`<div class="azdo">
         <div class="azdo-line">\${overallDot}<strong>GitHub Actions</strong> <span class="label">\${counts}</span></div>
-        \${workflowLines}
+        <details class="azdo-jobs"><summary>show jobs</summary><div class="azdo-jobs-content"><ul>\${jobs}</ul></div></details>
       </div>\`;
     }
 
@@ -1143,7 +1123,7 @@ const session = await joinSession({
                             sessionCount: Array.isArray(sessions) ? sessions.length : 0,
                             prCount: checks.data?.length ?? 0,
                             azdoBuilds: (checks.data ?? []).reduce((n, p) => n + (p.azdo?.builds?.length ?? 0), 0),
-                            ghaWorkflows: (checks.data ?? []).reduce((n, p) => n + (p.gha?.workflows?.length ?? 0), 0),
+                            ghaRuns: (checks.data ?? []).reduce((n, p) => n + (p.gha?.runs?.length ?? 0), 0),
                             errors: [sessions?.__error, checks.error].filter(Boolean),
                         };
                     },
