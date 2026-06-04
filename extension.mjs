@@ -413,6 +413,13 @@ const PAGE_HTML = `<!doctype html>
   <script>
     const esc = (s) => s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+    const syncTooltips = {
+      'up_to_date': 'Local session is in sync with the remote branch',
+      'behind': 'Remote branch has commits not yet pulled locally',
+      'ahead': 'Local session has commits not yet pushed to remote',
+      'diverged': 'Local and remote have diverged with different commits',
+    };
+
     function renderCopilot(rows) {
       if (!rows.length) return '<div class="empty">No active Copilot sessions with PRs.</div>';
       return '<ul class="list">' + rows.map(s => {
@@ -421,8 +428,8 @@ const PAGE_HTML = `<!doctype html>
         const repo  = s.repo_full_name ?? s.created_pr_repo ?? '(unknown repo)';
         const title = s._liveTitle ?? s.source_pr_title ?? s.workspace_name ?? '(untitled)';
         const head  = s.source_pr_head_ref ? \`\${esc(s.source_pr_head_ref)} → \${esc(s.source_pr_base_ref ?? '')}\` : esc(s.branch ?? '');
-        const draftBadge = s._liveDraft ? '<span class="badge draft">draft</span>' : '';
-        const syncBadge  = s.sync_state ? \`<span class="badge sync-\${esc(s.sync_state)}">\${esc(s.sync_state.replace(/_/g,' '))}</span>\` : '';
+        const draftBadge = s._liveDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
+        const syncBadge  = s.sync_state ? \`<span class="badge sync-\${esc(s.sync_state)}" title="\${esc(syncTooltips[s.sync_state] ?? '')}">\${esc(s.sync_state.replace(/_/g,' '))}</span>\` : '';
         const link = url ? \`<a href="\${esc(url)}" target="_blank" rel="noopener">#\${esc(num)}</a>\` : (num ? \`#\${esc(num)}\` : '');
         const updated = s._liveUpdatedAt ? \`updated \${new Date(s._liveUpdatedAt).toLocaleString()}\` : '';
         const meta = [head, updated].filter(Boolean).join(' · ');
@@ -504,9 +511,9 @@ const PAGE_HTML = `<!doctype html>
         const repo = p.repository.nameWithOwner;
         const key  = (repo + '#' + p.number).toLowerCase();
         const session = sessionIndex.get(key);
-        const draft = p.isDraft ? '<span class="badge draft">draft</span>' : '';
+        const draft = p.isDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
         const sessionBadge = session ? '<span class="badge session" title="A Copilot session is open for this PR">in session</span>' : '';
-        const syncBadge = session?.sync_state ? \`<span class="badge sync-\${esc(session.sync_state)}">\${esc(session.sync_state.replace(/_/g,' '))}</span>\` : '';
+        const syncBadge = session?.sync_state ? \`<span class="badge sync-\${esc(session.sync_state)}" title="\${esc(syncTooltips[session.sync_state] ?? '')}">\${esc(session.sync_state.replace(/_/g,' '))}</span>\` : '';
         const head = session?.source_pr_head_ref ? \`\${esc(session.source_pr_head_ref)} → \${esc(session.source_pr_base_ref ?? '')}\` : '';
         const updated = new Date(p.updatedAt).toLocaleString();
         const meta = [head, \`updated \${updated}\`].filter(Boolean).join(' · ');
