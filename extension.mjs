@@ -24,6 +24,8 @@ const DB_PATH = join(homedir(), ".copilot", "data.db");
 const GH_CACHE_TTL_MS = 60_000;
 // GraphQL-with-checks is heavier and more expensive on the rate limit.
 const CHECKS_CACHE_TTL_MS = 90_000;
+// Agent tasks list is used to map local session_ids to remote task URLs.
+const TASKS_CACHE_TTL_MS = 60_000;
 // Azure DevOps check runs are identified by detailsUrl host. Covers
 // dev.azure.com/<org> as well as legacy <org>.visualstudio.com URLs.
 const AZDO_URL_RE = /^https?:\/\/(dev\.azure\.com|[^/]+\.visualstudio\.com)\//i;
@@ -46,6 +48,7 @@ function fetchCopilotSessions() {
     const sql = `
         SELECT
             w.id          AS workspace_id,
+            w.session_id  AS session_id,
             w.name        AS workspace_name,
             w.branch      AS branch,
             w.updated_at  AS updated_at,
@@ -211,6 +214,66 @@ async function fetchPrsWithChecks({ force = false } = {}) {
         });
     checksCache = { at: now, value: shaped, error: null };
     return { data: shaped, cachedAt: now, error: null };
+}
+
+// Map local Copilot session_ids to remote task URLs by querying the
+// `api.githubcopilot.com/agents/tasks` endpoint. The desktop app exports each
+// local session to a server-side task whose UUID is what shows up in the
+// `github.com/<owner>/<repo>/tasks/<task-id>` web URL. Tasks are linked back
+// to local sessions through `agent_collaborators[].agent_task_id`.
+let tasksCache = { at: 0, value: null, error: null };
+function runGhAuthToken() {
+    return new Promise((resolve) => {
+        const child = spawn("gh", ["auth", "token"], { shell: false, windowsHide: true });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.on("data", (chunk) => (stdout += chunk.toString()));
+        child.stderr.on("data", (chunk) => (stderr += chunk.toString()));
+        child.on("error", (err) => resolve({ error: err.message }));
+        child.on("close", (code) => {
+            if (code === 0) resolve({ token: stdout.trim() });
+            else resolve({ error: stderr.trim() || `gh auth token exited with code ${code}` });
+        });
+    });
+}
+async function fetchAgentTasks({ force = false } = {}) {
+    const now = Date.now();
+    if (!force && tasksCache.value && now - tasksCache.at < TASKS_CACHE_TTL_MS) {
+        return { data: tasksCache.value, cachedAt: tasksCache.at, error: tasksCache.error };
+    }
+    const tokenResult = await runGhAuthToken();
+    if (tokenResult.error) {
+        tasksCache = { at: now, value: tasksCache.value, error: tokenResult.error };
+        return { data: tasksCache.value ?? new Map(), cachedAt: now, error: tokenResult.error };
+    }
+    try {
+        const res = await fetch("https://api.githubcopilot.com/agents/tasks", {
+            headers: {
+                Authorization: `Bearer ${tokenResult.token}`,
+                "Copilot-Integration-Id": "copilot-developer-app",
+                "Editor-Version": "copilot-cli-extension/1.0",
+                Accept: "application/json",
+            },
+        });
+        if (!res.ok) {
+            const msg = `tasks API HTTP ${res.status}`;
+            tasksCache = { at: now, value: tasksCache.value, error: msg };
+            return { data: tasksCache.value ?? new Map(), cachedAt: now, error: msg };
+        }
+        const body = await res.json();
+        // Build session_id -> task_id map
+        const map = new Map();
+        for (const t of body.tasks ?? []) {
+            for (const c of t.agent_collaborators ?? []) {
+                if (c.agent_task_id) map.set(c.agent_task_id, t.id);
+            }
+        }
+        tasksCache = { at: now, value: map, error: null };
+        return { data: map, cachedAt: now, error: null };
+    } catch (err) {
+        tasksCache = { at: now, value: tasksCache.value, error: err.message };
+        return { data: tasksCache.value ?? new Map(), cachedAt: now, error: err.message };
+    }
 }
 
 // Reduce a flat list of check runs into AzDO-only buckets, grouped by buildId.
@@ -431,7 +494,9 @@ const PAGE_HTML = `<!doctype html>
         const draftBadge = s._liveDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
         const syncBadge  = s.sync_state ? \`<span class="badge sync-\${esc(s.sync_state)}" title="\${esc(syncTooltips[s.sync_state] ?? '')}">\${esc(s.sync_state.replace(/_/g,' '))}</span>\` : '';
         const link = url ? \`<a href="\${esc(url)}" target="_blank" rel="noopener">#\${esc(num)}</a>\` : (num ? \`#\${esc(num)}\` : '');
-        const sessionInfo = s.workspace_id ? \`<span class="badge session" title="Workspace ID: \${esc(s.workspace_id)}">session</span>\` : '';
+        const sessionInfo = s._taskUrl
+          ? \`<a class="badge session" href="\${esc(s._taskUrl)}" target="_blank" rel="noopener" title="Open this session on github.com">session ↗</a>\`
+          : (s.workspace_id ? \`<span class="badge session" title="Workspace ID: \${esc(s.workspace_id)}">session</span>\` : '');
         const updated = s._liveUpdatedAt ? \`updated \${new Date(s._liveUpdatedAt).toLocaleString()}\` : '';
         const meta = [head, updated].filter(Boolean).join(' · ');
         return \`<li class="row">
@@ -513,7 +578,11 @@ const PAGE_HTML = `<!doctype html>
         const key  = (repo + '#' + p.number).toLowerCase();
         const session = sessionIndex.get(key);
         const draft = p.isDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
-        const sessionBadge = session ? \`<span class="badge session" title="A Copilot session is open for this PR (workspace \${esc(session.workspace_id)})">in session</span>\` : '';
+        const sessionBadge = session
+          ? (session._taskUrl
+              ? \`<a class="badge session" href="\${esc(session._taskUrl)}" target="_blank" rel="noopener" title="Open this session on github.com">in session ↗</a>\`
+              : \`<span class="badge session" title="A Copilot session is open for this PR (workspace \${esc(session.workspace_id)})">in session</span>\`)
+          : '';
         const syncBadge = session?.sync_state ? \`<span class="badge sync-\${esc(session.sync_state)}" title="\${esc(syncTooltips[session.sync_state] ?? '')}">\${esc(session.sync_state.replace(/_/g,' '))}</span>\` : '';
         const head = session?.source_pr_head_ref ? \`\${esc(session.source_pr_head_ref)} → \${esc(session.source_pr_base_ref ?? '')}\` : '';
         const updated = new Date(p.updatedAt).toLocaleString();
@@ -540,22 +609,30 @@ const PAGE_HTML = `<!doctype html>
         return;
       }
       lastSessions = res.rows;
-      // Cross-reference CI data from the checks cache
-      const checksRes = await fetch('/api/prs-with-checks').then(r => r.json());
+      // Cross-reference CI data from the checks cache and task URLs from the tasks API
+      const [checksRes, tasksRes] = await Promise.all([
+        fetch('/api/prs-with-checks').then(r => r.json()),
+        fetch('/api/tasks').then(r => r.json()),
+      ]);
       lastChecks = checksRes.rows ?? [];
       const ciIndex = new Map();
       for (const p of lastChecks) {
         const key = (p.repository.nameWithOwner + '#' + p.number).toLowerCase();
         ciIndex.set(key, p);
       }
-      // Attach CI data to each session row
+      const taskMap = new Map(Object.entries(tasksRes.tasks ?? {}));
+      // Attach CI data and remote task URL to each session row
       const enriched = res.rows.map(s => {
         const prNum = s.source_pr_number ?? s.created_pr_number;
         const repo = s.repo_full_name ?? s.created_pr_repo;
         const key = repo && prNum ? (repo + '#' + prNum).toLowerCase() : null;
         const ci = key ? ciIndex.get(key) : null;
-        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null, _liveTitle: ci?.title ?? null, _liveUpdatedAt: ci?.updatedAt ?? null, _liveDraft: ci?.isDraft ?? false };
+        const taskId = s.session_id ? taskMap.get(s.session_id) : null;
+        const taskUrl = taskId && repo ? \`https://github.com/\${repo}/tasks/\${taskId}\` : null;
+        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null, _liveTitle: ci?.title ?? null, _liveUpdatedAt: ci?.updatedAt ?? null, _liveDraft: ci?.isDraft ?? false, _taskUrl: taskUrl };
       });
+      // Stash the task map on the session rows for renderAll cross-reference
+      window.__taskMap = taskMap;
       document.getElementById('panel-copilot').innerHTML = renderCopilot(enriched);
       document.getElementById('copilot-count').textContent = ' (' + res.rows.length + ')';
     }
@@ -563,9 +640,14 @@ const PAGE_HTML = `<!doctype html>
     async function loadAll(force=false) {
       const res = await fetch('/api/prs-with-checks' + (force ? '?force=1' : '')).then(r => r.json());
       const sessionIndex = new Map();
+      const taskMap = window.__taskMap ?? new Map();
       for (const s of lastSessions) {
-        if (s.repo_full_name && s.source_pr_number)  sessionIndex.set((s.repo_full_name + '#' + s.source_pr_number).toLowerCase(), s);
-        if (s.created_pr_repo && s.created_pr_number) sessionIndex.set((s.created_pr_repo + '#' + s.created_pr_number).toLowerCase(), s);
+        const taskId = s.session_id ? taskMap.get(s.session_id) : null;
+        const repoForTask = s.repo_full_name ?? s.created_pr_repo;
+        const taskUrl = taskId && repoForTask ? \`https://github.com/\${repoForTask}/tasks/\${taskId}\` : null;
+        const enriched = { ...s, _taskUrl: taskUrl };
+        if (s.repo_full_name && s.source_pr_number)  sessionIndex.set((s.repo_full_name + '#' + s.source_pr_number).toLowerCase(), enriched);
+        if (s.created_pr_repo && s.created_pr_number) sessionIndex.set((s.created_pr_repo + '#' + s.created_pr_number).toLowerCase(), enriched);
       }
       const errorBanner = res.error ? \`<div class="error">\${esc(res.error)}</div>\` : '';
       document.getElementById('panel-all').innerHTML = errorBanner + renderAll(res.rows ?? [], sessionIndex);
@@ -616,6 +698,12 @@ async function startServer() {
                 const force = url.searchParams.get("force") === "1";
                 const { data, cachedAt, error } = await fetchPrsWithChecks({ force });
                 jsonResponse(res, { rows: data ?? [], cachedAt, error });
+            } else if (url.pathname === "/api/tasks") {
+                const force = url.searchParams.get("force") === "1";
+                const { data, cachedAt, error } = await fetchAgentTasks({ force });
+                // Serialize Map as plain object for JSON
+                const tasks = data ? Object.fromEntries(data) : {};
+                jsonResponse(res, { tasks, cachedAt, error });
             } else {
                 res.statusCode = 404;
                 res.end("not found");
