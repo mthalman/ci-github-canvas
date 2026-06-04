@@ -651,7 +651,7 @@ const PAGE_HTML = `<!doctype html>
         const updated = new Date(p.updatedAt).toLocaleString();
         const meta = [head, \`updated \${updated}\`].filter(Boolean).join(' · ');
         return renderPrRow({
-          headerHtml: \`<span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${sessionBadge}\${syncBadge}\`,
+          headerHtml: \`<span class="repo">\${esc(repo)}</span><a href="\${esc(p.url)}" target="_blank" rel="noopener">#\${esc(p.number)}</a>\${draft}\${syncBadge}\${sessionBadge}\`,
           titleHtml: esc(p.title),
           metaHtml: meta,
           gha: p.gha,
