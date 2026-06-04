@@ -65,9 +65,6 @@ function fetchCopilotSessions() {
             COALESCE(w.created_pr_html_url,      c.created_pr_html_url) AS created_pr_html_url,
             COALESCE(w.created_pr_state,         c.created_pr_state) AS created_pr_state,
 
-            COALESCE(w.source_issue_repo_full_name, c.repo_full_name) AS issue_repo,
-            COALESCE(w.source_issue_number,         c.source_issue_number) AS source_issue_number,
-
             s.state           AS sync_state,
             s.local_head_sha  AS local_head_sha,
             s.remote_head_sha AS remote_head_sha
@@ -369,8 +366,6 @@ const PAGE_HTML = `<!doctype html>
     .project { background: color-mix(in srgb, currentColor 8%, transparent); font-size: 0.75rem; }
     .repo { color: #888; font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; background: none; padding: 0; }
     .badge { text-transform: uppercase; letter-spacing: 0.03em; }
-    .badge.pr      { background: rgba(46,160,67,0.2); color: #2ea043; }
-    .badge.issue   { background: rgba(31,111,235,0.2); color: #1f6feb; }
     .badge.draft   { background: rgba(139,148,158,0.25); color: #8b949e; }
     .badge.session { background: rgba(210,153,34,0.2); color: #d29922; }
     .badge.closed  { background: rgba(248,81,73,0.2); color: #f85149; }
@@ -419,23 +414,20 @@ const PAGE_HTML = `<!doctype html>
     const esc = (s) => s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
     function renderCopilot(rows) {
-      if (!rows.length) return '<div class="empty">No active Copilot sessions.</div>';
+      if (!rows.length) return '<div class="empty">No active Copilot sessions with PRs.</div>';
       return '<ul class="list">' + rows.map(s => {
-        const isPr  = s.source_pr_number || s.created_pr_number;
-        const isIss = !isPr && s.source_issue_number;
-        const num   = s.source_pr_number ?? s.created_pr_number ?? s.source_issue_number;
-        const url   = s.source_pr_html_url ?? s.created_pr_html_url ?? (s.issue_repo && s.source_issue_number ? \`https://github.com/\${s.issue_repo}/issues/\${s.source_issue_number}\` : null);
-        const repo  = s.repo_full_name ?? s.created_pr_repo ?? s.issue_repo ?? '(unknown repo)';
+        const num   = s.source_pr_number ?? s.created_pr_number;
+        const url   = s.source_pr_html_url ?? s.created_pr_html_url;
+        const repo  = s.repo_full_name ?? s.created_pr_repo ?? '(unknown repo)';
         const title = s._liveTitle ?? s.source_pr_title ?? s.workspace_name ?? '(untitled)';
         const head  = s.source_pr_head_ref ? \`\${esc(s.source_pr_head_ref)} → \${esc(s.source_pr_base_ref ?? '')}\` : esc(s.branch ?? '');
-        const typeBadge = isPr ? '<span class="badge pr">PR</span>' : isIss ? '<span class="badge issue">Issue</span>' : '';
         const draftBadge = s._liveDraft ? '<span class="badge draft">draft</span>' : '';
         const syncBadge  = s.sync_state ? \`<span class="badge sync-\${esc(s.sync_state)}">\${esc(s.sync_state.replace(/_/g,' '))}</span>\` : '';
         const link = url ? \`<a href="\${esc(url)}" target="_blank" rel="noopener">#\${esc(num)}</a>\` : (num ? \`#\${esc(num)}\` : '');
         const updated = s._liveUpdatedAt ? \`updated \${new Date(s._liveUpdatedAt).toLocaleString()}\` : '';
         const meta = [head, updated].filter(Boolean).join(' · ');
         return \`<li class="row">
-          <div class="row-head"><span class="repo">\${esc(repo)}</span>\${link}\${typeBadge}\${draftBadge}\${syncBadge}</div>
+          <div class="row-head"><span class="repo">\${esc(repo)}</span>\${link}\${draftBadge}\${syncBadge}</div>
           <div class="row-title">\${esc(title)}</div>
           <div class="row-meta">\${meta}</div>
           \${renderGha(s._gha)}
