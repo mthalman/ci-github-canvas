@@ -31,6 +31,39 @@ const TASKS_CACHE_TTL_MS = 60_000;
 const AZDO_URL_RE = /^https?:\/\/(dev\.azure\.com|[^/]+\.visualstudio\.com)\//i;
 // Extract build id from an AzDO results URL: ".../_build/results?buildId=12345..."
 const AZDO_BUILD_ID_RE = /[?&]buildId=(\d+)/i;
+// Per-build timeline responses change quickly while a build runs, so keep
+// the cache short. Combined with the 60s auto-poll, this means a poll cycle
+// always returns fresh data without hammering AzDO when the UI re-renders.
+const AZDO_TIMELINE_CACHE_TTL_MS = 20_000;
+
+// Parse {org, project} from an AzDO check-run detailsUrl. Returns nulls when
+// the URL doesn't match a known shape (e.g. unexpected legacy collection URL).
+// Project names may be percent-encoded (e.g. "My%20Project"); we keep the
+// decoded form for display/cache keys and re-encode when calling the API.
+function parseAzdoUrl(detailsUrl) {
+    try {
+        const u = new URL(detailsUrl);
+        const segments = u.pathname.split("/").filter(Boolean);
+        if (/^dev\.azure\.com$/i.test(u.hostname)) {
+            // dev.azure.com/{org}/{project}/_build/results?buildId=N
+            return {
+                org: segments[0] ?? null,
+                project: segments[1] ? decodeURIComponent(segments[1]) : null,
+            };
+        }
+        const vsMatch = u.hostname.match(/^([^.]+)\.visualstudio\.com$/i);
+        if (vsMatch) {
+            // {org}.visualstudio.com/{project}/_build/results?buildId=N
+            return {
+                org: vsMatch[1],
+                project: segments[0] ? decodeURIComponent(segments[0]) : null,
+            };
+        }
+    } catch {
+        // fall through
+    }
+    return { org: null, project: null };
+}
 
 const servers = new Map();
 let db = null;
@@ -276,6 +309,84 @@ async function fetchAgentTasks({ force = false } = {}) {
     }
 }
 
+// Fetch the AzDO build timeline + top-level build info for one build.
+// Anonymous only: public orgs (e.g. dnceng-public) work; private orgs will
+// surface the AzDO error (typically 203 redirect / 401) in the timeline panel.
+const azdoTimelineCache = new Map(); // key -> { at, value, error }
+const azdoTimelineInFlight = new Map(); // key -> Promise
+
+async function fetchAzdoJson(url) {
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    const contentType = res.headers.get("content-type") ?? "";
+    // AzDO sign-in / auth-required responses are typically 203 with an HTML
+    // body, or 401/403. Detect those before trying to parse JSON.
+    if (!contentType.includes("application/json")) {
+        const status = res.status === 203 ? "203 (sign-in required)" : res.status;
+        throw new Error(`Azure DevOps returned ${status} — build may be in a private project (anonymous access only).`);
+    }
+    if (!res.ok) {
+        throw new Error(`Azure DevOps HTTP ${res.status} ${res.statusText}`);
+    }
+    return res.json();
+}
+
+async function fetchAzdoTimeline({ org, project, buildId, force = false }) {
+    const key = `${org}|${project}|${buildId}`;
+    const now = Date.now();
+    if (!force) {
+        const cached = azdoTimelineCache.get(key);
+        if (cached && now - cached.at < AZDO_TIMELINE_CACHE_TTL_MS) {
+            return { data: cached.value, cachedAt: cached.at, error: cached.error };
+        }
+        const inflight = azdoTimelineInFlight.get(key);
+        if (inflight) return inflight;
+    }
+    const promise = (async () => {
+        const projectEnc = encodeURIComponent(project);
+        const orgEnc = encodeURIComponent(org);
+        const buildUrl = `https://dev.azure.com/${orgEnc}/${projectEnc}/_apis/build/builds/${buildId}?api-version=7.1`;
+        const timelineUrl = `https://dev.azure.com/${orgEnc}/${projectEnc}/_apis/build/builds/${buildId}/timeline?api-version=7.1`;
+        try {
+            const [build, timeline] = await Promise.all([
+                fetchAzdoJson(buildUrl),
+                fetchAzdoJson(timelineUrl),
+            ]);
+            const value = {
+                build: {
+                    status: build.status,
+                    result: build.result,
+                    startTime: build.startTime,
+                    finishTime: build.finishTime,
+                    url: build._links?.web?.href ?? null,
+                    buildNumber: build.buildNumber,
+                },
+                records: (timeline?.records ?? []).map((r) => ({
+                    id: r.id,
+                    parentId: r.parentId,
+                    type: r.type,
+                    name: r.name,
+                    state: r.state,
+                    result: r.result,
+                    order: r.order,
+                    startTime: r.startTime,
+                    finishTime: r.finishTime,
+                    percentComplete: r.percentComplete,
+                    log: r.log ? { url: r.log.url } : null,
+                })),
+            };
+            azdoTimelineCache.set(key, { at: now, value, error: null });
+            return { data: value, cachedAt: now, error: null };
+        } catch (err) {
+            azdoTimelineCache.set(key, { at: now, value: null, error: err.message });
+            return { data: null, cachedAt: now, error: err.message };
+        } finally {
+            azdoTimelineInFlight.delete(key);
+        }
+    })();
+    azdoTimelineInFlight.set(key, promise);
+    return promise;
+}
+
 // Reduce a flat list of check runs into AzDO-only buckets, grouped by buildId.
 // Returns { builds: [...], summary: { total, success, failure, inProgress, ... }, hasAny }.
 function summarizeAzdoRuns(runs) {
@@ -287,12 +398,13 @@ function summarizeAzdoRuns(runs) {
     for (const r of azdoRuns) {
         const idMatch = r.detailsUrl.match(AZDO_BUILD_ID_RE);
         const key = idMatch ? `b:${idMatch[1]}` : `u:${new URL(r.detailsUrl).origin}`;
-        const orgMatch = r.detailsUrl.match(/dev\.azure\.com\/([^/]+)/i);
+        const { org, project } = parseAzdoUrl(r.detailsUrl);
         let entry = builds.get(key);
         if (!entry) {
             entry = {
                 buildId: idMatch?.[1] ?? null,
-                org: orgMatch?.[1] ?? null,
+                org,
+                project,
                 summaryUrl: idMatch ? r.detailsUrl.replace(/&view=.*$/, "").replace(/&jobId=.*$/, "") : r.detailsUrl,
                 runs: [],
             };
@@ -328,55 +440,44 @@ function summarizeAzdoRuns(runs) {
     };
 }
 
-// Reduce non-AzDO check runs into GitHub Actions workflow buckets, grouped by workflow name.
-// Returns { workflows: [...], summary: { total, success, failure, inProgress, ... }, hasAny }.
+// Flatten non-AzDO check runs into a single list. Each GHA check run becomes
+// one row; we used to group by workflow name (the part before " / " in the
+// check name) but that produced spurious parent/child cards for GitHub App
+// checks like "license/cla" whose name happens to contain "/".
+// Returns { runs: [...], summary: {...}, hasAny }.
 function summarizeGhaRuns(runs) {
     const ghaRuns = runs.filter((r) => r?.detailsUrl && !AZDO_URL_RE.test(r.detailsUrl));
     if (ghaRuns.length === 0) {
-        return { hasAny: false, workflows: [], summary: null };
+        return { hasAny: false, runs: [], summary: null };
     }
-    // Group by workflow name (the part before the " / " separator in the check run name).
-    const workflows = new Map();
-    for (const r of ghaRuns) {
-        const parts = r.name.split(" / ");
-        const workflowName = parts.length > 1 ? parts[0] : r.name;
-        let entry = workflows.get(workflowName);
-        if (!entry) {
-            // Derive workflow URL from detailsUrl (strip job-specific path segments)
-            const workflowUrl = r.detailsUrl
-                ? r.detailsUrl.replace(/\/job\/[^?#]*/, "")
-                : null;
-            entry = { name: workflowName, url: workflowUrl, runs: [] };
-            workflows.set(workflowName, entry);
-        }
-        entry.runs.push({
+    const summary = { total: 0, success: 0, failure: 0, inProgress: 0, other: 0 };
+    const shaped = ghaRuns.map((r) => {
+        summary.total++;
+        if (r.status !== "COMPLETED") summary.inProgress++;
+        else if (r.conclusion === "SUCCESS" || r.conclusion === "NEUTRAL" || r.conclusion === "SKIPPED") summary.success++;
+        else if (r.conclusion === "FAILURE" || r.conclusion === "TIMED_OUT" || r.conclusion === "STARTUP_FAILURE" || r.conclusion === "ACTION_REQUIRED") summary.failure++;
+        else summary.other++;
+        return {
             name: r.name,
             status: r.status,
             conclusion: r.conclusion,
             detailsUrl: r.detailsUrl,
             startedAt: r.startedAt,
             completedAt: r.completedAt,
-        });
-    }
-    const summary = { total: 0, success: 0, failure: 0, inProgress: 0, other: 0 };
-    for (const w of workflows.values()) {
-        for (const r of w.runs) {
-            summary.total++;
-            if (r.status !== "COMPLETED") summary.inProgress++;
-            else if (r.conclusion === "SUCCESS" || r.conclusion === "NEUTRAL" || r.conclusion === "SKIPPED") summary.success++;
-            else if (r.conclusion === "FAILURE" || r.conclusion === "TIMED_OUT" || r.conclusion === "STARTUP_FAILURE" || r.conclusion === "ACTION_REQUIRED") summary.failure++;
-            else summary.other++;
-        }
-    }
+        };
+    });
     summary.overall =
         summary.failure > 0 ? "failure" :
         summary.inProgress > 0 ? "in_progress" :
         summary.success > 0 ? "success" : "other";
-    return {
-        hasAny: true,
-        workflows: [...workflows.values()].sort((a, b) => a.name.localeCompare(b.name)),
-        summary,
-    };
+    // Sort by start time for parity with AzDO job ordering.
+    shaped.sort((a, b) => {
+        const ta = a.startedAt ? new Date(a.startedAt).getTime() : Infinity;
+        const tb = b.startedAt ? new Date(b.startedAt).getTime() : Infinity;
+        if (ta !== tb) return ta - tb;
+        return String(a.name).localeCompare(String(b.name));
+    });
+    return { hasAny: true, runs: shaped, summary };
 }
 
 // Build a quick lookup key for cross-referencing tab 2 against tab 1.
@@ -453,6 +554,10 @@ const PAGE_HTML = `<!doctype html>
     details.azdo-jobs summary { cursor: pointer; font-size: 0.75rem; color: #888; list-style: revert; }
     details.azdo-jobs ul { list-style: none; padding-left: 1rem; margin: 0.25rem 0 0; }
     details.azdo-jobs li { font-size: 0.75rem; font-family: ui-monospace, Consolas, monospace; padding: 0.1rem 0; display: flex; gap: 0.4rem; align-items: center; }
+    .azdo-timeline { margin: 0.25rem 0 0; }
+    .azdo-timeline .tl-fallback-note { color: #d29922; font-size: 0.7rem; padding: 0.2rem 0; }
+    .azdo-timeline .tl-loading { color: #888; font-size: 0.75rem; padding: 0.2rem 0; }
+    .azdo-timeline .tl-error { color: #f85149; font-size: 0.75rem; padding: 0.2rem 0; white-space: pre-wrap; }
 
     /* Collapsible PR rows. Default-open unless every CI check passed. */
     li.row-collapsible { padding: 0; }
@@ -521,8 +626,10 @@ const PAGE_HTML = `<!doctype html>
     }
 
     // Build a PR row that's collapsible when CI is present. Default-open unless
-    // every check has passed.
-    function renderPrRow({ headerHtml, titleHtml, metaHtml, gha, azdo }) {
+    // every check has passed. prKey (e.g. owner/repo#123) gives the details
+    // element a stable identity so open/closed state survives auto-refresh
+    // re-renders via snapshotPrRowState/restorePrRowState.
+    function renderPrRow({ headerHtml, titleHtml, metaHtml, gha, azdo, prKey }) {
       const overall = overallCiState(gha, azdo);
       const overallDot = overall
         ? \`<span class="ci-dot \${overall} overall" title="\${esc(overallCiTooltips[overall] ?? '')}"></span>\`
@@ -534,8 +641,9 @@ const PAGE_HTML = `<!doctype html>
         return \`<li class="row">\${head}\${title}\${meta}</li>\`;
       }
       const openAttr = overall === 'success' ? '' : 'open';
+      const keyAttr = prKey ? \` data-pr-key="\${esc(prKey)}"\` : '';
       const body = \`\${renderGha(gha)}\${renderAzdo(azdo)}\`;
-      return \`<li class="row row-collapsible"><details \${openAttr}>
+      return \`<li class="row row-collapsible"><details\${keyAttr} \${openAttr}>
         <summary>
           <span class="caret">▶</span>
           <div class="row-summary-content">\${head}\${title}\${meta}</div>
@@ -560,12 +668,14 @@ const PAGE_HTML = `<!doctype html>
           : (s.workspace_id ? \`<span class="badge session" title="Workspace ID: \${esc(s.workspace_id)}">session</span>\` : '');
         const updated = s._liveUpdatedAt ? \`updated \${new Date(s._liveUpdatedAt).toLocaleString()}\` : '';
         const meta = [head, updated].filter(Boolean).join(' · ');
+        const prKey = repo && num ? (repo + '#' + num).toLowerCase() : null;
         return renderPrRow({
           headerHtml: \`<span class="repo">\${esc(repo)}</span>\${link}\${draftBadge}\${syncBadge}\${sessionInfo}\`,
           titleHtml: esc(title),
           metaHtml: '',
           gha: s._gha,
           azdo: s._azdo,
+          prKey,
         });
       }).join('') + '</ul>';
     }
@@ -594,10 +704,18 @@ const PAGE_HTML = `<!doctype html>
         const label = b.buildId
           ? \`<a href="\${esc(b.summaryUrl)}" target="_blank" rel="noopener">build \${esc(b.buildId)}</a>\${b.org ? \` <span class="label">(\${esc(b.org)})</span>\` : ''}\`
           : \`<a href="\${esc(b.summaryUrl)}" target="_blank" rel="noopener">\${esc(b.summaryUrl)}</a>\`;
-        const jobs = b.runs.map(r => \`<li><span class="ci-dot \${runDotClass(r)}"></span><a href="\${esc(r.detailsUrl)}" target="_blank" rel="noopener">\${esc(r.name)}</a> <span class="label">\${esc(runStatusLabel(r))}</span></li>\`).join('');
+        const ghJobs = b.runs.map(r => \`<li><span class="ci-dot \${runDotClass(r)}"></span><a href="\${esc(r.detailsUrl)}" target="_blank" rel="noopener">\${esc(r.name)}</a> <span class="label">\${esc(runStatusLabel(r))}</span></li>\`).join('');
+        // The <details> block is timeline-capable when we have org+project+buildId.
+        // Inner content starts as the GitHub-derived list (immediate fallback);
+        // on first open, the lazy loader replaces it with the live AzDO timeline.
+        // If the AzDO call fails the loader puts the fallback list back with an
+        // explanatory note.
+        const timelineAttrs = (b.org && b.project && b.buildId)
+          ? \` data-tl-org="\${esc(b.org)}" data-tl-project="\${esc(b.project)}" data-tl-build-id="\${esc(b.buildId)}" data-tl-summary-url="\${esc(b.summaryUrl)}"\`
+          : '';
         return \`<div class="azdo-build">
           <div class="azdo-line">\${label} <span class="label">· \${b.runs.length} job\${b.runs.length === 1 ? '' : 's'}</span></div>
-          <details class="azdo-jobs"><summary>show jobs</summary><ul>\${jobs}</ul></details>
+          <details class="azdo-jobs"\${timelineAttrs}><summary>show jobs</summary><div class="azdo-jobs-content"><ul>\${ghJobs}</ul></div></details>
         </div>\`;
       }).join('');
       return \`<div class="azdo">
@@ -616,25 +734,17 @@ const PAGE_HTML = `<!doctype html>
         s.inProgress  ? \`<span title="in progress" style="color:#d29922">⟳ \${s.inProgress}</span>\` : '',
         s.other       ? \`<span title="other">· \${s.other}</span>\` : '',
       ].filter(Boolean).join(' ');
-      const workflowLines = gha.workflows.map(w => {
-        const label = w.url
-          ? \`<a href="\${esc(w.url)}" target="_blank" rel="noopener">\${esc(w.name)}</a>\`
-          : esc(w.name);
-        const jobs = w.runs.map(r => \`<li><span class="ci-dot \${runDotClass(r)}"></span><a href="\${esc(r.detailsUrl)}" target="_blank" rel="noopener">\${esc(r.name)}</a> <span class="label">\${esc(runStatusLabel(r))}</span></li>\`).join('');
-        return \`<div class="azdo-build">
-          <div class="azdo-line">\${label} <span class="label">· \${w.runs.length} job\${w.runs.length === 1 ? '' : 's'}</span></div>
-          <details class="azdo-jobs"><summary>show jobs</summary><ul>\${jobs}</ul></details>
-        </div>\`;
-      }).join('');
+      const jobs = gha.runs.map(r => \`<li><span class="ci-dot \${runDotClass(r)}"></span><a href="\${esc(r.detailsUrl)}" target="_blank" rel="noopener">\${esc(r.name)}</a> <span class="label">\${esc(runStatusLabel(r))}</span></li>\`).join('');
       return \`<div class="azdo">
         <div class="azdo-line">\${overallDot}<strong>GitHub Actions</strong> <span class="label">\${counts}</span></div>
-        \${workflowLines}
+        <details class="azdo-jobs"><summary>show jobs</summary><div class="azdo-jobs-content"><ul>\${jobs}</ul></div></details>
       </div>\`;
     }
 
     function renderAll(prs, sessionIndex) {
-      if (!prs.length) return '<div class="empty">No open PRs authored by you.</div>';
-      return '<ul class="list">' + prs.map(p => {
+      const withChecks = prs.filter(p => p.azdo?.hasAny || p.gha?.hasAny);
+      if (!withChecks.length) return '<div class="empty">No open PRs with CI checks.</div>';
+      return '<ul class="list">' + withChecks.map(p => {
         const repo = p.repository.nameWithOwner;
         const key  = (repo + '#' + p.number).toLowerCase();
         const session = sessionIndex.get(key);
@@ -654,6 +764,7 @@ const PAGE_HTML = `<!doctype html>
           metaHtml: '',
           gha: p.gha,
           azdo: p.azdo,
+          prKey: key,
         });
       }).join('') + '</ul>';
     }
@@ -694,7 +805,11 @@ const PAGE_HTML = `<!doctype html>
       });
       // Stash the task map on the session rows for renderAll cross-reference
       window.__taskMap = taskMap;
+      const openTimelines = snapshotOpenAzdoTimelines();
+      const prRowState = snapshotPrRowState();
       document.getElementById('panel-copilot').innerHTML = renderCopilot(enriched);
+      restorePrRowState(prRowState);
+      restoreOpenAzdoTimelines(openTimelines);
       document.getElementById('copilot-count').textContent = ' (' + res.rows.length + ')';
     }
 
@@ -711,9 +826,177 @@ const PAGE_HTML = `<!doctype html>
         if (s.created_pr_repo && s.created_pr_number) sessionIndex.set((s.created_pr_repo + '#' + s.created_pr_number).toLowerCase(), enriched);
       }
       const errorBanner = res.error ? \`<div class="error">\${esc(res.error)}</div>\` : '';
+      const openTimelines = snapshotOpenAzdoTimelines();
+      const prRowState = snapshotPrRowState();
       document.getElementById('panel-all').innerHTML = errorBanner + renderAll(res.rows ?? [], sessionIndex);
-      document.getElementById('all-count').textContent = res.rows ? ' (' + res.rows.length + ')' : '';
+      restorePrRowState(prRowState);
+      restoreOpenAzdoTimelines(openTimelines);
+      const visibleCount = (res.rows ?? []).filter(p => p.azdo?.hasAny || p.gha?.hasAny).length;
+      document.getElementById('all-count').textContent = res.rows ? ' (' + visibleCount + ')' : '';
     }
+
+    // ---- AzDO timeline (real per-job status from dev.azure.com REST API) ----
+    //
+    // Each <details class="azdo-jobs"> for a build with a known org/project/buildId
+    // is timeline-capable. On open we lazy-load /api/azdo-timeline and replace
+    // the GitHub-check-run fallback list inside .azdo-jobs-content with the
+    // real AzDO record tree (stages → phases → jobs → tasks).
+    //
+    // Open-state survives the 60s auto-refresh: snapshotOpenAzdoTimelines() is
+    // called before each panel re-render, and restoreOpenAzdoTimelines() reopens
+    // matching details after the new DOM is in place and triggers a fresh load.
+
+    function azdoTimelineKey(detailsEl) {
+      const org = detailsEl.dataset.tlOrg;
+      const project = detailsEl.dataset.tlProject;
+      const buildId = detailsEl.dataset.tlBuildId;
+      return org && project && buildId ? \`\${org}|\${project}|\${buildId}\` : null;
+    }
+
+    function snapshotOpenAzdoTimelines() {
+      const keys = new Set();
+      document.querySelectorAll('details.azdo-jobs[open]').forEach(d => {
+        const k = azdoTimelineKey(d);
+        if (k) keys.add(k);
+      });
+      return keys;
+    }
+
+    function restoreOpenAzdoTimelines(keys) {
+      if (!keys || keys.size === 0) return;
+      document.querySelectorAll('details.azdo-jobs').forEach(d => {
+        const k = azdoTimelineKey(d);
+        if (k && keys.has(k)) {
+          d.open = true;
+          loadAzdoTimeline(d, { force: true });
+        }
+      });
+    }
+
+    // Snapshot/restore the open/closed state of every PR-row <details> by key.
+    // Without this, the 60s auto-refresh (and the manual Refresh button) wipes
+    // the user's manual collapse/expand and forces every row back to the
+    // default-open-unless-all-checks-passed state.
+    function snapshotPrRowState() {
+      const state = new Map();
+      document.querySelectorAll('details[data-pr-key]').forEach(d => {
+        state.set(d.dataset.prKey, d.open);
+      });
+      return state;
+    }
+
+    function restorePrRowState(state) {
+      if (!state || state.size === 0) return;
+      document.querySelectorAll('details[data-pr-key]').forEach(d => {
+        if (state.has(d.dataset.prKey)) d.open = state.get(d.dataset.prKey);
+      });
+    }
+
+    function tlDotClass(state, result) {
+      if (state !== 'completed') return 'in_progress';
+      if (result === 'succeeded' || result === 'skipped') return 'success';
+      if (result === 'failed' || result === 'abandoned') return 'failure';
+      return 'other';
+    }
+    function tlStatusLabel(state, result) {
+      if (state !== 'completed') return (state || 'pending').toLowerCase();
+      return (result || 'unknown').toLowerCase();
+    }
+
+    function renderTimelineJobs(records, summaryUrl) {
+      if (!records || records.length === 0) {
+        return '<div class="tl-loading">No timeline records yet — build may still be queuing.</div>';
+      }
+      // AzDO timelines contain Stage / Phase / Job / Task / Checkpoint records.
+      // For parity with the GHA jobs list we only show Job records, flat, in
+      // execution order. Parent Stage/Phase context is dropped to keep the UI
+      // consistent across CI systems.
+      const jobs = records
+        .filter(r => r.type === 'Job')
+        .sort((a, b) => {
+          // Order by start time when present (most useful while a build runs),
+          // fall back to the timeline 'order' field, then name.
+          const ta = a.startTime ? new Date(a.startTime).getTime() : Infinity;
+          const tb = b.startTime ? new Date(b.startTime).getTime() : Infinity;
+          if (ta !== tb) return ta - tb;
+          return (a.order ?? 0) - (b.order ?? 0) || String(a.name).localeCompare(String(b.name));
+        });
+      if (jobs.length === 0) {
+        return '<div class="tl-loading">No job records yet — build may still be queuing.</div>';
+      }
+      // Build the AzDO web logs URL from the build summary URL by stripping
+      // any pre-existing view/job query params we may have inherited.
+      const baseLog = summaryUrl
+        ? summaryUrl.replace(/&view=[^&]*/g, '').replace(/&j=[^&]*/g, '').replace(/&t=[^&]*/g, '')
+        : null;
+      return '<ul>' + jobs.map(r => {
+        const dot = tlDotClass(r.state, r.result);
+        const label = tlStatusLabel(r.state, r.result);
+        const href = baseLog ? \`\${baseLog}&view=logs&j=\${encodeURIComponent(r.id)}\` : null;
+        const nameHtml = href
+          ? \`<a href="\${esc(href)}" target="_blank" rel="noopener">\${esc(r.name)}</a>\`
+          : esc(r.name);
+        return \`<li><span class="ci-dot \${dot}"></span>\${nameHtml} <span class="label">\${esc(label)}</span></li>\`;
+      }).join('') + '</ul>';
+    }
+
+    // Per-details guard to avoid overlapping requests for the same panel.
+    const tlInflight = new WeakSet();
+
+    async function loadAzdoTimeline(detailsEl, { force = false } = {}) {
+      if (tlInflight.has(detailsEl)) return;
+      const org = detailsEl.dataset.tlOrg;
+      const project = detailsEl.dataset.tlProject;
+      const buildId = detailsEl.dataset.tlBuildId;
+      const summaryUrl = detailsEl.dataset.tlSummaryUrl;
+      if (!org || !project || !buildId) return;
+      const content = detailsEl.querySelector('.azdo-jobs-content');
+      if (!content) return;
+      // Preserve the initial GitHub-check-run fallback once, so we can restore
+      // it on error. Cached on the element so re-renders see fresh fallback.
+      if (content.dataset.fallbackHtml == null) {
+        content.dataset.fallbackHtml = content.innerHTML;
+      }
+      if (!force && detailsEl.dataset.tlLoaded === '1') return;
+      tlInflight.add(detailsEl);
+      const wrapper = document.createElement('div');
+      wrapper.className = 'azdo-timeline';
+      wrapper.innerHTML = '<div class="tl-loading">Loading Azure DevOps timeline…</div>';
+      content.replaceChildren(wrapper);
+      try {
+        const params = new URLSearchParams({ org, project, buildId });
+        if (force) params.set('force', '1');
+        const res = await fetch('/api/azdo-timeline?' + params.toString()).then(r => r.json());
+        if (!detailsEl.isConnected) return;
+        if (res.error || !res.data) {
+          // Show the error AND keep the GitHub check-run list visible so the
+          // user still sees something useful (e.g. private-org builds where
+          // anonymous access is blocked).
+          wrapper.innerHTML = \`<div class="tl-error">\${esc(res.error || 'Failed to load timeline')}</div>
+            <div class="tl-fallback-note">Showing GitHub check-run jobs instead:</div>
+            \${content.dataset.fallbackHtml}\`;
+        } else {
+          wrapper.innerHTML = renderTimelineJobs(res.data.records, summaryUrl);
+          detailsEl.dataset.tlLoaded = '1';
+        }
+      } catch (e) {
+        if (!detailsEl.isConnected) return;
+        wrapper.innerHTML = \`<div class="tl-error">\${esc(e.message)}</div>
+          <div class="tl-fallback-note">Showing GitHub check-run jobs instead:</div>
+          \${content.dataset.fallbackHtml}\`;
+      } finally {
+        tlInflight.delete(detailsEl);
+      }
+    }
+
+    // Delegated toggle listener — every azdo-jobs details element on the page
+    // triggers a lazy load when first opened.
+    document.addEventListener('toggle', (e) => {
+      const el = e.target;
+      if (el && el.matches && el.matches('details.azdo-jobs') && el.open) {
+        loadAzdoTimeline(el);
+      }
+    }, true);
 
     document.querySelectorAll('.tab').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -724,6 +1007,32 @@ const PAGE_HTML = `<!doctype html>
     document.getElementById('refresh').addEventListener('click', async () => {
       await loadCopilot();
       await loadAll(true);
+    });
+
+    // Auto-poll every minute. Skip while hidden to spare the GitHub rate limit;
+    // refresh immediately on becoming visible if a poll was missed. A flag
+    // prevents overlapping refreshes if a previous one is still in flight.
+    const POLL_INTERVAL_MS = 60_000;
+    let refreshing = false;
+    let lastPollAt = Date.now();
+    async function autoRefresh() {
+      if (refreshing || document.hidden) return;
+      refreshing = true;
+      try {
+        await loadCopilot();
+        await loadAll(true);
+        lastPollAt = Date.now();
+      } catch (e) {
+        console.error('auto-refresh failed', e);
+      } finally {
+        refreshing = false;
+      }
+    }
+    setInterval(autoRefresh, POLL_INTERVAL_MS);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && Date.now() - lastPollAt >= POLL_INTERVAL_MS) {
+        autoRefresh();
+      }
     });
 
     (async () => {
@@ -763,6 +1072,24 @@ async function startServer() {
                 // Serialize Map as plain object for JSON
                 const tasks = data ? Object.fromEntries(data) : {};
                 jsonResponse(res, { tasks, cachedAt, error });
+            } else if (url.pathname === "/api/azdo-timeline") {
+                const org = url.searchParams.get("org") ?? "";
+                const project = url.searchParams.get("project") ?? "";
+                const buildId = url.searchParams.get("buildId") ?? "";
+                const force = url.searchParams.get("force") === "1";
+                // Validate: org names are restricted by Azure (alphanumerics,
+                // dashes, underscores). Projects allow more characters and may
+                // contain spaces, so we reject only path/query separators and
+                // control chars. buildId must be digits.
+                const orgOk = /^[A-Za-z0-9._-]{1,64}$/.test(org);
+                const projectOk = project.length > 0 && project.length <= 128 && !/[\/\\?#\x00-\x1f]/.test(project);
+                const buildIdOk = /^\d{1,12}$/.test(buildId);
+                if (!orgOk || !projectOk || !buildIdOk) {
+                    jsonResponse(res, { error: "invalid org/project/buildId" }, 400);
+                } else {
+                    const { data, cachedAt, error } = await fetchAzdoTimeline({ org, project, buildId, force });
+                    jsonResponse(res, { data, cachedAt, error });
+                }
             } else {
                 res.statusCode = 404;
                 res.end("not found");
@@ -796,7 +1123,7 @@ const session = await joinSession({
                             sessionCount: Array.isArray(sessions) ? sessions.length : 0,
                             prCount: checks.data?.length ?? 0,
                             azdoBuilds: (checks.data ?? []).reduce((n, p) => n + (p.azdo?.builds?.length ?? 0), 0),
-                            ghaWorkflows: (checks.data ?? []).reduce((n, p) => n + (p.gha?.workflows?.length ?? 0), 0),
+                            ghaRuns: (checks.data ?? []).reduce((n, p) => n + (p.gha?.runs?.length ?? 0), 0),
                             errors: [sessions?.__error, checks.error].filter(Boolean),
                         };
                     },
