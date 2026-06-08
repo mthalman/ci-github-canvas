@@ -13,7 +13,7 @@
 
 import { createServer } from "node:http";
 import { DatabaseSync } from "node:sqlite";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
@@ -35,6 +35,18 @@ const AZDO_BUILD_ID_RE = /[?&]buildId=(\d+)/i;
 // the cache short. Combined with the 60s auto-poll, this means a poll cycle
 // always returns fresh data without hammering AzDO when the UI re-renders.
 const AZDO_TIMELINE_CACHE_TTL_MS = 20_000;
+// Sync-state badge (up_to_date / behind / ahead / diverged) is derived by
+// shelling out to `git rev-list` per session. Cache for a short window so
+// the UI's ~60s auto-poll doesn't repeatedly spawn git for the same path.
+// We cache nulls/errors too — a workspace with no upstream shouldn't
+// re-spawn git on every poll just to fail again.
+const SYNC_STATE_CACHE_TTL_MS = 15_000;
+// Hard cap on concurrent git invocations. On a machine with many sessions
+// this prevents `/api/sessions` from spawning a thundering herd of git.exe.
+const SYNC_STATE_GIT_CONCURRENCY = 4;
+// Each git invocation gets its own timeout in case the worktree is on a
+// slow drive or git wedges on a lock.
+const SYNC_STATE_GIT_TIMEOUT_MS = 5_000;
 
 // Parse {org, project} from an AzDO check-run detailsUrl. Returns nulls when
 // the URL doesn't match a known shape (e.g. unexpected legacy collection URL).
@@ -74,10 +86,163 @@ function getDb() {
     return db;
 }
 
+// Probe for an optional table once per db handle. The Copilot desktop app's
+// schema is internal and may add/remove tables between versions; we use this
+// to degrade gracefully (e.g. omit checkout_path when the bindings table is
+// missing) instead of erroring the whole tab.
+const tableExistsCache = new Map();
+function tableExists(name) {
+    if (tableExistsCache.has(name)) return tableExistsCache.get(name);
+    try {
+        const row = getDb()
+            .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1")
+            .get(name);
+        const exists = !!row?.ok;
+        tableExistsCache.set(name, exists);
+        return exists;
+    } catch {
+        tableExistsCache.set(name, false);
+        return false;
+    }
+}
+
+// Run an async task with bounded concurrency. Lightweight in-process limiter
+// so we don't pull in p-limit for a single use site.
+async function mapLimit(items, limit, fn) {
+    const out = new Array(items.length);
+    let next = 0;
+    async function worker() {
+        while (true) {
+            const i = next++;
+            if (i >= items.length) return;
+            out[i] = await fn(items[i], i);
+        }
+    }
+    const workers = [];
+    for (let i = 0; i < Math.min(limit, items.length); i++) workers.push(worker());
+    await Promise.all(workers);
+    return out;
+}
+
+// Compute a coarse local-vs-upstream sync state for a checkout. Compares
+// HEAD against its configured upstream (`@{u}`), which is whatever the
+// worktree was last told to track. We deliberately do NOT `git fetch` here
+// — that would mutate the workspace and contact the network on every poll
+// — so this reflects the state as of the last fetch, not GitHub's live tip.
+const syncStateCache = new Map(); // checkoutPath -> { at, state }
+const syncStateInflight = new Map(); // checkoutPath -> Promise<state>
+
+function runGitForSync(args, cwd) {
+    return new Promise((resolve) => {
+        execFile(
+            "git",
+            ["-C", cwd, "--no-optional-locks", ...args],
+            {
+                shell: false,
+                windowsHide: true,
+                timeout: SYNC_STATE_GIT_TIMEOUT_MS,
+                env: {
+                    ...process.env,
+                    // Defense-in-depth: rev-list shouldn't prompt or contact the
+                    // network, but make sure we never accidentally block on a
+                    // credential helper.
+                    GIT_TERMINAL_PROMPT: "0",
+                    GCM_INTERACTIVE: "Never",
+                },
+            },
+            (err, stdout, stderr) => {
+                if (err) resolve({ error: (stderr || err.message || "").toString().trim() });
+                else resolve({ stdout: stdout.toString().trim() });
+            },
+        );
+    });
+}
+
+async function computeSyncState(checkoutPath) {
+    if (!checkoutPath) return null;
+    const now = Date.now();
+    const cached = syncStateCache.get(checkoutPath);
+    if (cached && now - cached.at < SYNC_STATE_CACHE_TTL_MS) return cached.state;
+    const pending = syncStateInflight.get(checkoutPath);
+    if (pending) return pending;
+
+    const work = (async () => {
+        const r = await runGitForSync(
+            ["rev-list", "--left-right", "--count", "@{u}...HEAD"],
+            checkoutPath,
+        );
+        let state = null;
+        if (!r.error && r.stdout) {
+            // Output is "<behind>\t<ahead>" — left side is commits in @{u}
+            // not in HEAD (behind); right side is commits in HEAD not in
+            // @{u} (ahead).
+            const parts = r.stdout.split(/\s+/);
+            const behind = Number(parts[0]) || 0;
+            const ahead = Number(parts[1]) || 0;
+            if (behind === 0 && ahead === 0) state = "up_to_date";
+            else if (behind > 0 && ahead === 0) state = "behind";
+            else if (behind === 0 && ahead > 0) state = "ahead";
+            else state = "diverged";
+        }
+        syncStateCache.set(checkoutPath, { at: Date.now(), state });
+        return state;
+    })();
+
+    syncStateInflight.set(checkoutPath, work);
+    try {
+        return await work;
+    } finally {
+        syncStateInflight.delete(checkoutPath);
+    }
+}
+
+async function enrichSessionsWithSyncState(rows) {
+    if (!Array.isArray(rows) || !rows.length) return rows;
+    // De-dupe by checkout_path so multiple sessions pointing at the same
+    // checkout (rare, but possible for in_place bindings) only spawn git once.
+    const uniquePaths = [...new Set(rows.map((r) => r.checkout_path).filter(Boolean))];
+    const results = await mapLimit(uniquePaths, SYNC_STATE_GIT_CONCURRENCY, async (p) => [
+        p,
+        await computeSyncState(p),
+    ]);
+    const byPath = new Map(results);
+    for (const r of rows) {
+        r.sync_state = r.checkout_path ? byPath.get(r.checkout_path) ?? null : null;
+    }
+    return rows;
+}
+
 // One row per non-archived workspace. PR / issue fields are coalesced from
 // both `workspaces` (older shape) and `workspace_repo_contexts` (newer shape)
 // so we work on either app version.
+//
+// Also pulls a representative `checkout_path` for the workspace via a
+// correlated subquery on `workspace_checkout_bindings`. For multi-repo
+// workspaces we prefer the binding whose `repo_full_name` matches the PR's
+// repo (case-insensitive — GitHub repo names are effectively case-insensitive
+// but SQLite `=` is not). The path is later used to derive a local-vs-upstream
+// sync-state badge via git. When the bindings table doesn't exist on this
+// app version we fall back to a query without that column.
 function fetchCopilotSessions() {
+    const hasBindings = tableExists("workspace_checkout_bindings");
+    const checkoutPathSelect = hasBindings
+        ? `,
+            COALESCE(
+                (SELECT cb.checkout_path
+                   FROM workspace_checkout_bindings cb
+                  WHERE cb.workspace_id = w.id
+                    AND LOWER(cb.repo_full_name) = LOWER(COALESCE(
+                            w.source_pr_repo_full_name,
+                            w.created_pr_repo_full_name,
+                            c.repo_full_name))
+                  LIMIT 1),
+                (SELECT cb.checkout_path
+                   FROM workspace_checkout_bindings cb
+                  WHERE cb.workspace_id = w.id
+                  LIMIT 1)
+            ) AS checkout_path`
+        : `,
+            NULL AS checkout_path`;
     const sql = `
         SELECT
             w.id          AS workspace_id,
@@ -99,7 +264,7 @@ function fetchCopilotSessions() {
             COALESCE(w.created_pr_repo_full_name, c.repo_full_name) AS created_pr_repo,
             COALESCE(w.created_pr_number,        c.created_pr_number) AS created_pr_number,
             COALESCE(w.created_pr_html_url,      c.created_pr_html_url) AS created_pr_html_url,
-            COALESCE(w.created_pr_state,         c.created_pr_state) AS created_pr_state
+            COALESCE(w.created_pr_state,         c.created_pr_state) AS created_pr_state${checkoutPathSelect}
         FROM workspaces w
         LEFT JOIN projects p                ON p.id = w.project_id
         LEFT JOIN workspace_repo_contexts c ON c.workspace_id = w.id
@@ -595,10 +760,10 @@ const PAGE_HTML = `<!doctype html>
     const esc = (s) => s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
     const syncTooltips = {
-      'up_to_date': 'Local session is in sync with the remote branch',
-      'behind': 'Remote branch has commits not yet pulled locally',
-      'ahead': 'Local session has commits not yet pushed to remote',
-      'diverged': 'Local and remote have diverged with different commits',
+      'up_to_date': 'Local session matches its tracked upstream (as of the last fetch)',
+      'behind':     'Tracked upstream has commits not in your local branch (as of the last fetch)',
+      'ahead':      'Local branch has commits not yet pushed to its tracked upstream (as of the last fetch)',
+      'diverged':   'Local and upstream have diverged with different commits (as of the last fetch)',
     };
 
     const overallCiTooltips = {
@@ -1051,6 +1216,7 @@ async function startServer() {
                 if (rows && rows.__error) {
                     jsonResponse(res, { error: rows.__error });
                 } else {
+                    await enrichSessionsWithSyncState(rows);
                     jsonResponse(res, { rows });
                 }
             } else if (url.pathname === "/api/prs") {
