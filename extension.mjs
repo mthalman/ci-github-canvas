@@ -99,15 +99,10 @@ function fetchCopilotSessions() {
             COALESCE(w.created_pr_repo_full_name, c.repo_full_name) AS created_pr_repo,
             COALESCE(w.created_pr_number,        c.created_pr_number) AS created_pr_number,
             COALESCE(w.created_pr_html_url,      c.created_pr_html_url) AS created_pr_html_url,
-            COALESCE(w.created_pr_state,         c.created_pr_state) AS created_pr_state,
-
-            s.state           AS sync_state,
-            s.local_head_sha  AS local_head_sha,
-            s.remote_head_sha AS remote_head_sha
+            COALESCE(w.created_pr_state,         c.created_pr_state) AS created_pr_state
         FROM workspaces w
         LEFT JOIN projects p                ON p.id = w.project_id
         LEFT JOIN workspace_repo_contexts c ON c.workspace_id = w.id
-        LEFT JOIN workspace_pr_sync_status s ON s.workspace_id = w.id
         WHERE w.archived_at IS NULL
           AND (
                 w.source_pr_number  IS NOT NULL
