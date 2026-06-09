@@ -814,13 +814,31 @@ function summarizeAzdoRuns(runs) {
 // check name) but that produced spurious parent/child cards for GitHub App
 // checks like "license/cla" whose name happens to contain "/".
 // Returns { runs: [...], summary: {...}, hasAny }.
+//
+// Dedup: GitHub keeps every check-run a commit ever had, so re-running a
+// workflow (or close/reopen triggering one) leaves the older check-runs on
+// the commit too. We dedupe by job name, keeping the entry whose workflow
+// run id (parsed from detailsUrl `/actions/runs/{id}/job/...`) is highest,
+// so each workflow's latest invocation wins. Jobs with unique names across
+// workflows are unaffected.
 function summarizeGhaRuns(runs) {
     const ghaRuns = runs.filter((r) => r?.detailsUrl && !AZDO_URL_RE.test(r.detailsUrl));
     if (ghaRuns.length === 0) {
         return { hasAny: false, runs: [], summary: null };
     }
+    const dedupedByName = new Map();
+    for (const r of ghaRuns) {
+        const runIdMatch = typeof r.detailsUrl === "string"
+            ? r.detailsUrl.match(/\/actions\/runs\/(\d+)\b/)
+            : null;
+        const runId = runIdMatch ? Number(runIdMatch[1]) : 0;
+        const existing = dedupedByName.get(r.name);
+        if (!existing || runId > existing.__runId) {
+            dedupedByName.set(r.name, Object.assign({}, r, { __runId: runId }));
+        }
+    }
     const summary = { total: 0, success: 0, failure: 0, inProgress: 0, other: 0 };
-    const shaped = ghaRuns.map((r) => {
+    const shaped = [...dedupedByName.values()].map((r) => {
         summary.total++;
         if (r.status !== "COMPLETED") summary.inProgress++;
         else if (r.conclusion === "SUCCESS" || r.conclusion === "NEUTRAL" || r.conclusion === "SKIPPED") summary.success++;
@@ -1017,7 +1035,16 @@ function collectNotifyStates(prs) {
         for (const r of pr.gha?.runs ?? []) {
             // No parent-build aggregation for GHA — each check-run stands
             // alone, so we register the same entry under both maps.
-            const ghaKey = `${prUrl}|gha|${r.name}`;
+            // Include the workflow run id in the key so a re-run on the same
+            // commit (same job name, possibly same conclusion) registers as
+            // a distinct entry, the way AzDO uses buildId. Without this, a
+            // re-run that lands in the same success/failure state as the
+            // prior run is treated as "no change" and silently swallowed.
+            const runIdMatch = typeof r.detailsUrl === "string"
+                ? r.detailsUrl.match(/\/actions\/runs\/(\d+)\b/)
+                : null;
+            const runId = runIdMatch ? runIdMatch[1] : "norun";
+            const ghaKey = `${prUrl}|gha|${runId}|${r.name}`;
             const entry = {
                 state: classifyRun(r),
                 meta: { prLabel, prUrl, label: `GHA · ${r.name}`, url: r.detailsUrl },
@@ -1029,16 +1056,20 @@ function collectNotifyStates(prs) {
     return { buildStates, jobStates };
 }
 
-// Run-completion diff: fire only on a real in_progress → completed transition.
-// Items that appear already-completed in the snapshot (i.e. we never saw them
-// running) are deliberately skipped to avoid alerting on every fresh PR whose
-// CI happened to finish before our first poll noticed it.
+// Run-completion diff: fire whenever a build/job lands in a completed state
+// we haven't already reported for it. That covers both the classic
+// in_progress → completed transition AND the unseen → completed case (e.g. a
+// GHA check-run that GitHub registers late and is already done by the time we
+// first see it — without this we'd silently miss it). Same-state repeats
+// (prev=success, next=success) are skipped so we don't re-alert every poll,
+// and the seed-poll guard in runNotifyPoll() still prevents an alert flood
+// on the very first poll after extension load.
 function diffNewCompletions(prevMap, nextMap) {
     const out = [];
     for (const [key, next] of nextMap) {
         if (next.state === "in_progress") continue;
         const prev = prevMap.get(key);
-        if (prev?.state !== "in_progress") continue;
+        if (prev && prev.state === next.state) continue;
         out.push({ key, ...next });
     }
     return out;
@@ -1059,6 +1090,11 @@ function diffNewFailures(prevMap, nextMap) {
     return out;
 }
 
+// Build both the user-facing alert (what shows up in the chat timeline) and
+// the model-facing prompt (which also carries the acknowledgement instruction
+// so the agent responds, triggering the desktop notification chime).
+// The `prLabel` is rendered as a markdown link to the GitHub PR URL so the
+// user can click straight through to the PR rather than landing on the build.
 function formatAlertMessage(completions, failures) {
     const lines = [];
     for (const c of completions) {
@@ -1066,20 +1102,20 @@ function formatAlertMessage(completions, failures) {
             c.state === "success" ? "passed" :
             c.state === "failure" ? "failed" :
             c.state === "other"   ? "completed (mixed)" : "completed";
-        lines.push(`- ${c.meta.prLabel} · ${c.meta.label} ${word} — ${c.meta.url}`);
+        lines.push(`- [${c.meta.prLabel}](${c.meta.prUrl}) · ${c.meta.label} ${word} — ${c.meta.url}`);
     }
     for (const f of failures) {
-        lines.push(`- ${f.meta.prLabel} · ${f.meta.label} failed — ${f.meta.url}`);
+        lines.push(`- [${f.meta.prLabel}](${f.meta.prUrl}) · ${f.meta.label} failed — ${f.meta.url}`);
     }
     const total = completions.length + failures.length;
     const header = total === 1 ? `CI update: 1 event.` : `CI update: ${total} events.`;
-    return [
-        header,
-        "",
-        ...lines,
+    const display = [header, "", ...lines].join("\n");
+    const prompt = [
+        display,
         "",
         "Reply with one short acknowledgement (no investigation, no tools).",
     ].join("\n");
+    return { prompt, displayPrompt: display };
 }
 
 async function runNotifyPoll() {
@@ -1116,6 +1152,9 @@ async function runNotifyPoll() {
             ? diffNewFailures(prevJobs, jobStates) : [];
         if (completions.length === 0 && failures.length === 0) return;
         try {
+            // `prompt` carries the acknowledgement directive the model needs;
+            // `displayPrompt` is what the user sees in the timeline, omitting
+            // that directive so it reads as a clean CI status update.
             await activeSession.send(formatAlertMessage(completions, failures));
         } catch (err) {
             console.error("ci-runs: failed to send notify alert", err);
