@@ -4,14 +4,14 @@
 
 .PARAMETER Name
     Folder name under the Copilot extensions directory to remove. Defaults to
-    'pr-pipelines' to match install-dev-link.ps1.
+    'ci-runs' to match install-dev-link.ps1.
 
 .EXAMPLE
     pwsh .\uninstall-dev-link.ps1
 #>
 [CmdletBinding()]
 param(
-    [string] $Name = 'pr-pipelines'
+    [string] $Name = 'ci-runs'
 )
 
 $ErrorActionPreference = 'Stop'

@@ -16,7 +16,7 @@
 
 .PARAMETER Name
     Folder name to create under the Copilot extensions directory. Defaults to
-    'pr-pipelines' so it matches the canvas id declared by the extension.
+    'ci-runs' so it matches the canvas id declared by the extension.
 
 .PARAMETER Force
     If the destination already exists (as a regular file, a symlink, or a junction),
@@ -25,16 +25,16 @@
 
 .EXAMPLE
     pwsh .\install-dev-link.ps1
-    # Symlinks extension.mjs to ~/.copilot/extensions/pr-pipelines/extension.mjs.
+    # Symlinks extension.mjs to ~/.copilot/extensions/ci-runs/extension.mjs.
 
 .EXAMPLE
-    pwsh .\install-dev-link.ps1 -Name pr-pipelines-dev -Force
+    pwsh .\install-dev-link.ps1 -Name ci-runs-dev -Force
     # Installs under a different folder name so it doesn't collide with an
     # already-installed copy, replacing any prior dev link.
 #>
 [CmdletBinding()]
 param(
-    [string] $Name = 'pr-pipelines',
+    [string] $Name = 'ci-runs',
     [switch] $Force
 )
 
