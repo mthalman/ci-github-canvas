@@ -249,11 +249,18 @@ function sessionPrRefs(row) {
     return refs;
 }
 
-// Fetch live PullRequest.state for a set of PR refs in a single batched
-// GraphQL call (using aliased fields). Returns a Map keyed by "owner/name#num"
-// (lower) -> { state, error }. Results are cached; only cache-misses (or
-// expired entries) are queried.
-async function fetchLivePrStates(refs) {
+// Fetch live PullRequest info (state, title, isDraft) for a set of PR refs in
+// a single batched GraphQL call (using aliased fields). Returns a Map keyed
+// by "owner/name#num" (lower) -> { state, title, isDraft, error }. Results
+// are cached; only cache-misses (or expired entries) are queried.
+//
+// `state` drives session-row filtering (CLOSED/MERGED rows are hidden), while
+// `title`/`isDraft` are surfaced in the Copilot tab so PRs not authored by
+// @me (e.g. Copilot-agent-created PRs, which the CHECKS_QUERY misses) still
+// show the real PR title instead of the local workspace name. `error` stays
+// tied to `state` only — a row with a known state but a missing title is
+// still a usable signal for filtering.
+async function fetchLivePrInfo(refs) {
     const now = Date.now();
     const result = new Map();
     const toQuery = [];
@@ -273,7 +280,7 @@ async function fetchLivePrStates(refs) {
     const fields = toQuery
         .map(
             (ref, i) =>
-                `  pr${i}: repository(owner: ${JSON.stringify(ref.owner)}, name: ${JSON.stringify(ref.name)}) { pullRequest(number: ${ref.number}) { state } }`,
+                `  pr${i}: repository(owner: ${JSON.stringify(ref.owner)}, name: ${JSON.stringify(ref.name)}) { pullRequest(number: ${ref.number}) { state title isDraft } }`,
         )
         .join("\n");
     const query = `query {\n${fields}\n}`;
@@ -282,7 +289,7 @@ async function fetchLivePrStates(refs) {
     if (gqlResult.error) {
         // Cache the error per-ref so we don't spam gh on every poll.
         for (const ref of toQuery) {
-            const entry = { at: now, state: null, error: gqlResult.error };
+            const entry = { at: now, state: null, title: null, isDraft: false, error: gqlResult.error };
             prLiveStateCache.set(ref.key, entry);
             result.set(ref.key, entry);
         }
@@ -293,8 +300,15 @@ async function fetchLivePrStates(refs) {
     // get a null state which the caller treats as "no signal".
     const data = gqlResult.data?.data ?? {};
     toQuery.forEach((ref, i) => {
-        const state = data?.[`pr${i}`]?.pullRequest?.state ?? null;
-        const entry = { at: now, state, error: state ? null : "no data" };
+        const pr = data?.[`pr${i}`]?.pullRequest;
+        const state = pr?.state ?? null;
+        const entry = {
+            at: now,
+            state,
+            title: pr?.title ?? null,
+            isDraft: pr?.isDraft ?? false,
+            error: state ? null : "no data",
+        };
         prLiveStateCache.set(ref.key, entry);
         result.set(ref.key, entry);
     });
@@ -304,6 +318,12 @@ async function fetchLivePrStates(refs) {
 // Drop session rows whose every associated PR is CLOSED or MERGED according
 // to live GitHub state. Rows whose PR can't be resolved (errors, missing
 // data) are kept — we err toward showing rather than hiding stale state.
+//
+// Side effect: when a live title/isDraft are available, they're attached to
+// the surviving rows as `_liveTitle` / `_liveDraft` so the renderer can show
+// the real PR title (not the local workspace name) even for PRs not authored
+// by @me. The source PR's title is preferred over the created PR's, matching
+// the rest of the renderer's source-first display priority.
 async function filterSessionsByLivePrState(rows) {
     if (!Array.isArray(rows) || !rows.length) return rows;
     const allRefs = [];
@@ -319,22 +339,39 @@ async function filterSessionsByLivePrState(rows) {
         }
     }
     if (allRefs.length === 0) return rows;
-    const states = await fetchLivePrStates(allRefs);
-    return rows.filter((_, i) => {
+    const states = await fetchLivePrInfo(allRefs);
+    const kept = [];
+    for (let i = 0; i < rows.length; i++) {
         const refs = refsByRow[i];
-        if (!refs.length) return true; // no PR refs — shouldn't happen given SQL filter
+        // No PR refs — shouldn't happen given SQL filter, but keep defensively.
+        if (!refs.length) { kept.push(rows[i]); continue; }
         let sawSignal = false;
+        let isOpen = false;
         for (const ref of refs) {
             const entry = states.get(ref.key);
             if (!entry || entry.error) continue; // no usable signal for this ref
             sawSignal = true;
-            if (entry.state === "OPEN") return true;
+            if (entry.state === "OPEN") { isOpen = true; break; }
         }
-        // No PR was confirmed OPEN. Drop only if we got at least one
-        // confirmed CLOSED/MERGED signal; otherwise keep (live lookup
-        // gave us no useful data, fall back to local DB state).
-        return !sawSignal;
-    });
+        // Drop only if at least one PR returned a confirmed CLOSED/MERGED
+        // signal AND no PR was OPEN. Otherwise keep (live lookup gave us no
+        // useful data, fall back to local DB state).
+        if (sawSignal && !isOpen) continue;
+        // sessionPrRefs returns source PR first, created PR second; pick the
+        // first ref that has a non-null live title/draft so the visible row
+        // metadata matches the link/badge target in renderCopilot.
+        let liveTitle = null;
+        let liveDraft = false;
+        for (const ref of refs) {
+            const entry = states.get(ref.key);
+            if (!entry) continue;
+            if (liveTitle == null && entry.title) liveTitle = entry.title;
+            if (entry.isDraft) liveDraft = true;
+            if (liveTitle != null) break;
+        }
+        kept.push({ ...rows[i], _liveTitle: liveTitle, _liveDraft: liveDraft });
+    }
+    return kept;
 }
 
 // One row per non-archived workspace. PR / issue fields are coalesced from
@@ -1000,7 +1037,7 @@ const PAGE_HTML = `<!doctype html>
         const num   = s.source_pr_number ?? s.created_pr_number;
         const url   = s.source_pr_html_url ?? s.created_pr_html_url;
         const repo  = s.repo_full_name ?? s.created_pr_repo ?? '(unknown repo)';
-        const title = s._liveTitle ?? s.source_pr_title ?? s.workspace_name ?? '(untitled)';
+        const title = s._liveTitle ?? s.source_pr_title ?? '(untitled)';
         const head  = s.source_pr_head_ref ? \`\${esc(s.source_pr_head_ref)} → \${esc(s.source_pr_base_ref ?? '')}\` : esc(s.branch ?? '');
         const draftBadge = s._liveDraft ? '<span class="badge draft" title="This PR is still in draft">draft</span>' : '';
         const syncBadge  = s.sync_state ? \`<span class="badge sync-\${esc(s.sync_state)}" title="\${esc(syncTooltips[s.sync_state] ?? '')}">\${esc(s.sync_state.replace(/_/g,' '))}</span>\` : '';
@@ -1143,7 +1180,7 @@ const PAGE_HTML = `<!doctype html>
         const ci = key ? ciIndex.get(key) : null;
         const taskId = s.session_id ? taskMap.get(s.session_id) : null;
         const taskUrl = taskId && repo ? \`https://github.com/\${repo}/tasks/\${taskId}\` : null;
-        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null, _liveTitle: ci?.title ?? null, _liveUpdatedAt: ci?.updatedAt ?? null, _liveDraft: ci?.isDraft ?? false, _taskUrl: taskUrl };
+        return { ...s, _gha: ci?.gha ?? null, _azdo: ci?.azdo ?? null, _liveTitle: ci?.title ?? s._liveTitle ?? null, _liveUpdatedAt: ci?.updatedAt ?? null, _liveDraft: ci?.isDraft ?? s._liveDraft ?? false, _taskUrl: taskUrl };
       });
       // Stash the task map on the session rows for renderAll cross-reference
       window.__taskMap = taskMap;
