@@ -19,8 +19,8 @@ User-scoped (works across all your Copilot projects):
 
 ```powershell
 # From the directory containing this README
-New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.copilot\extensions\pr-pipelines" | Out-Null
-Copy-Item .\extension.mjs "$env:USERPROFILE\.copilot\extensions\pr-pipelines\extension.mjs" -Force
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.copilot\extensions\ci-runs" | Out-Null
+Copy-Item .\extension.mjs "$env:USERPROFILE\.copilot\extensions\ci-runs\extension.mjs" -Force
 ```
 
 Then, inside any Copilot CLI session, reload extensions:
@@ -37,7 +37,7 @@ If you've published this folder to a GitHub repo, anyone can install with:
 install_extension({
   url:   "https://github.com/<owner>/ci-github-canvas",
   scope: "user",
-  name:  "pr-pipelines"
+  name:  "ci-runs"
 })
 ```
 
@@ -71,7 +71,7 @@ Ask the agent something like:
 
 > show me my PR pipelines
 
-The agent will open the `pr-pipelines` canvas in a side panel. From there:
+The agent will open the `ci-runs` canvas in a side panel. From there:
 
 - Click `↻ Refresh` to re-read the local session DB and re-query GitHub.
 - Click the AzDO build link to open the run in `dev.azure.com`.

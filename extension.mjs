@@ -1,4 +1,4 @@
-// Extension: pr-pipelines (v0.3)
+// Extension: ci-runs (v0.3)
 //
 // User-scoped canvas: side-panel dashboard with two tabs.
 //   1. "Copilot" tab  - workspaces currently open in the desktop app, with
@@ -16,6 +16,7 @@ import { DatabaseSync } from "node:sqlite";
 import { spawn, execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
 
 const DB_PATH = join(homedir(), ".copilot", "data.db");
@@ -56,6 +57,15 @@ const SYNC_STATE_GIT_TIMEOUT_MS = 5_000;
 const PR_LIVE_STATE_CACHE_TTL_MS = 5 * 60_000;
 const PR_LIVE_STATE_ERROR_CACHE_TTL_MS = 30_000;
 
+// Notification config persists across extension reloads. Defaults are
+// intentionally conservative: notifications OFF, build-level granularity
+// (one alert per build that flips red, instead of one per failing job).
+const NOTIFY_CONFIG_PATH = join(homedir(), ".copilot", "ci-runs.json");
+// Host-side poll cadence. Runs whether or not the canvas is open, so the
+// user gets alerts even when the side panel isn't visible. Matches the
+// in-canvas auto-refresh interval to keep load symmetric.
+const HOST_POLL_INTERVAL_MS = 60_000;
+
 // Parse {org, project} from an AzDO check-run detailsUrl. Returns nulls when
 // the URL doesn't match a known shape (e.g. unexpected legacy collection URL).
 // Project names may be percent-encoded (e.g. "My%20Project"); we keep the
@@ -87,6 +97,30 @@ function parseAzdoUrl(detailsUrl) {
 
 const servers = new Map();
 let db = null;
+// Assigned after joinSession() resolves; used by the host-side notifier to
+// call session.send(). Declared at module scope so HTTP handlers and the
+// background poll loop can reach the session handle without taking it as a
+// parameter.
+let activeSession = null;
+
+// In-memory mirror of the on-disk notify config. Loaded eagerly at startup;
+// HTTP POST /api/notify-config updates both this and the JSON file.
+//
+// The two notification modes are independent and may both be on at once:
+//   notifyOnRunCompletion — fire when a build/run finishes (any conclusion).
+//   notifyOnJobFailure    — fire when an individual job transitions to failure.
+let notifyConfig = { notifyOnRunCompletion: false, notifyOnJobFailure: false };
+// Per-build aggregated state (used by the run-completion diff) and per-job
+// state (used by the failure diff). Both maps are rebuilt every poll
+// regardless of which flags are on, so toggling a flag never triggers
+// retroactive alerts for already-seen items.
+const lastBuildStates = new Map();
+const lastJobStates = new Map();
+// First-poll seeding flag: the very first successful poll after extension
+// load just records current state without firing alerts (otherwise every
+// already-red or already-completed check would alert on startup).
+let notifyStateSeeded = false;
+let notifyPollInFlight = false;
 
 function getDb() {
     if (db) return db;
@@ -839,6 +873,260 @@ function jsonResponse(res, body, status = 200) {
     res.end(JSON.stringify(body));
 }
 
+// Read a JSON body off an http request with a hard 1MB cap. Resolves to {}
+// for empty bodies; rejects on malformed JSON or oversize payloads.
+function readJsonBody(req) {
+    return new Promise((resolve, reject) => {
+        let body = "";
+        req.on("data", (chunk) => {
+            body += chunk;
+            if (body.length > 1_000_000) {
+                req.destroy();
+                reject(new Error("request body too large"));
+            }
+        });
+        req.on("end", () => {
+            if (!body) return resolve({});
+            try { resolve(JSON.parse(body)); } catch (e) { reject(e); }
+        });
+        req.on("error", reject);
+    });
+}
+
+// =============================================================================
+// Failure notifier
+// =============================================================================
+// Host-side polling loop that watches every PR's CI runs and fires a
+// session.send() alert when one of two independent transitions happens:
+//   - "run completion": an AzDO build or GHA check-run goes from in-progress
+//     to any completed state (success, failure, or other).
+//   - "job failure": an individual job transitions from non-failure to failure.
+// Both events can fire from the same poll cycle; they're coalesced into one
+// session.send() so the chat only chimes once per poll.
+//
+// session.send() injects a user message into the chat, which makes the agent
+// respond — and the agent's response is what plays the desktop app's
+// notification chime when the turn settles.
+//
+// Notes:
+// - "Build completion" treats in_progress as dominant (any in-progress job
+//   keeps the whole build in_progress); only fires once everything is done.
+// - GHA check-runs are leaf nodes (no sub-jobs we can see). Each acts as
+//   both its own "build" (for run-completion) and "job" (for failures).
+// - The first successful poll after extension load seeds state silently, so
+//   the user doesn't get alerted about every already-completed or already-red
+//   check on startup.
+
+function sanitizeNotifyConfig(raw) {
+    const out = { notifyOnRunCompletion: false, notifyOnJobFailure: false };
+    if (!raw || typeof raw !== "object") return out;
+    const hasNew = "notifyOnRunCompletion" in raw || "notifyOnJobFailure" in raw;
+    if (hasNew) {
+        if (typeof raw.notifyOnRunCompletion === "boolean") out.notifyOnRunCompletion = raw.notifyOnRunCompletion;
+        if (typeof raw.notifyOnJobFailure === "boolean") out.notifyOnJobFailure = raw.notifyOnJobFailure;
+    } else if (typeof raw.enabled === "boolean") {
+        // Migrate the older { enabled, granularity } shape — the closest
+        // semantic match is the failure-notification path. Run-completion
+        // is a new behavior the old config never expressed, so it stays off.
+        out.notifyOnJobFailure = raw.enabled;
+    }
+    return out;
+}
+
+async function initNotifyConfig() {
+    try {
+        const text = await readFile(NOTIFY_CONFIG_PATH, "utf8");
+        notifyConfig = sanitizeNotifyConfig(JSON.parse(text));
+    } catch (err) {
+        // ENOENT just means the user has never saved a config yet — silently
+        // fall through to defaults. Any other error (corrupt JSON, perms) is
+        // logged but doesn't block the extension from starting.
+        if (err?.code !== "ENOENT") {
+            console.error("ci-runs: failed to load notify config", err);
+        }
+    }
+    return notifyConfig;
+}
+
+async function saveNotifyConfig(next) {
+    notifyConfig = sanitizeNotifyConfig(next);
+    try {
+        // Best-effort mkdir for the parent — ~/.copilot generally already
+        // exists because the desktop app creates it, but covering the case
+        // where the user wipes it costs little.
+        await mkdir(join(homedir(), ".copilot"), { recursive: true });
+        await writeFile(NOTIFY_CONFIG_PATH, JSON.stringify(notifyConfig, null, 2), "utf8");
+    } catch (err) {
+        console.error("ci-runs: failed to persist notify config", err);
+    }
+    return notifyConfig;
+}
+
+// Classify one check-run into the four states the UI/notifier care about.
+// Mirrors the inline logic inside summarizeAzdoRuns/summarizeGhaRuns; kept
+// as a separate helper because the notifier needs to derive per-build and
+// per-job state independently from the pre-summarized snapshot.
+function classifyRun(r) {
+    if (r.status !== "COMPLETED") return "in_progress";
+    if (r.conclusion === "SUCCESS" || r.conclusion === "NEUTRAL" || r.conclusion === "SKIPPED") return "success";
+    if (r.conclusion === "FAILURE" || r.conclusion === "TIMED_OUT" || r.conclusion === "STARTUP_FAILURE" || r.conclusion === "ACTION_REQUIRED") return "failure";
+    return "other";
+}
+
+// Walk a fetchPrsWithChecks() snapshot and build the per-build and per-job
+// state maps in one pass. Each value carries enough metadata for the alert
+// formatter to produce a readable line without re-walking the snapshot.
+function collectNotifyStates(prs) {
+    const buildStates = new Map();
+    const jobStates = new Map();
+    for (const pr of prs ?? []) {
+        const prLabel = `${pr.repository?.nameWithOwner ?? "unknown"}#${pr.number}`;
+        const prUrl = pr.url;
+
+        for (const b of pr.azdo?.builds ?? []) {
+            const buildLabel = b.buildId ? `AzDO build #${b.buildId}` : "AzDO build";
+            const buildKey = `${prUrl}|azdo|${b.buildId ?? b.summaryUrl}`;
+            // Build-level overall for run-completion: in_progress wins so the
+            // build only counts as "done" once every job has settled. Once
+            // settled, failure wins over success so the message reflects
+            // whether the build passed overall.
+            let nFail = 0, nProg = 0, nOk = 0;
+            for (const r of b.runs) {
+                const s = classifyRun(r);
+                if (s === "failure") nFail++;
+                else if (s === "in_progress") nProg++;
+                else if (s === "success") nOk++;
+            }
+            const buildOverall =
+                nProg > 0 ? "in_progress" :
+                nFail > 0 ? "failure" :
+                nOk > 0 ? "success" : "other";
+            buildStates.set(buildKey, {
+                state: buildOverall,
+                meta: { prLabel, prUrl, label: buildLabel, url: b.summaryUrl },
+            });
+            for (const r of b.runs) {
+                const jobKey = `${prUrl}|azdo|${b.buildId ?? b.summaryUrl}|${r.name}`;
+                jobStates.set(jobKey, {
+                    state: classifyRun(r),
+                    meta: { prLabel, prUrl, label: `${buildLabel} · ${r.name}`, url: r.detailsUrl || b.summaryUrl },
+                });
+            }
+        }
+
+        for (const r of pr.gha?.runs ?? []) {
+            // No parent-build aggregation for GHA — each check-run stands
+            // alone, so we register the same entry under both maps.
+            const ghaKey = `${prUrl}|gha|${r.name}`;
+            const entry = {
+                state: classifyRun(r),
+                meta: { prLabel, prUrl, label: `GHA · ${r.name}`, url: r.detailsUrl },
+            };
+            buildStates.set(ghaKey, entry);
+            jobStates.set(ghaKey, entry);
+        }
+    }
+    return { buildStates, jobStates };
+}
+
+// Run-completion diff: fire only on a real in_progress → completed transition.
+// Items that appear already-completed in the snapshot (i.e. we never saw them
+// running) are deliberately skipped to avoid alerting on every fresh PR whose
+// CI happened to finish before our first poll noticed it.
+function diffNewCompletions(prevMap, nextMap) {
+    const out = [];
+    for (const [key, next] of nextMap) {
+        if (next.state === "in_progress") continue;
+        const prev = prevMap.get(key);
+        if (prev?.state !== "in_progress") continue;
+        out.push({ key, ...next });
+    }
+    return out;
+}
+
+// Failure diff: fire on any non-failure → failure transition, INCLUDING the
+// unseen → failure case (a brand-new job that started already broken). For
+// failures we want to err on the side of telling the user — missing a real
+// failure is worse than the rare spurious alert.
+function diffNewFailures(prevMap, nextMap) {
+    const out = [];
+    for (const [key, next] of nextMap) {
+        if (next.state !== "failure") continue;
+        const prev = prevMap.get(key);
+        if (prev?.state === "failure") continue;
+        out.push({ key, ...next });
+    }
+    return out;
+}
+
+function formatAlertMessage(completions, failures) {
+    const lines = [];
+    for (const c of completions) {
+        const word =
+            c.state === "success" ? "passed" :
+            c.state === "failure" ? "failed" :
+            c.state === "other"   ? "completed (mixed)" : "completed";
+        lines.push(`- ${c.meta.prLabel} · ${c.meta.label} ${word} — ${c.meta.url}`);
+    }
+    for (const f of failures) {
+        lines.push(`- ${f.meta.prLabel} · ${f.meta.label} failed — ${f.meta.url}`);
+    }
+    const total = completions.length + failures.length;
+    const header = total === 1 ? `CI update: 1 event.` : `CI update: ${total} events.`;
+    return [
+        header,
+        "",
+        ...lines,
+        "",
+        "Reply with one short acknowledgement (no investigation, no tools).",
+    ].join("\n");
+}
+
+async function runNotifyPoll() {
+    if (notifyPollInFlight) return;
+    notifyPollInFlight = true;
+    try {
+        // Force a fresh fetch — the cache TTL would otherwise let us miss
+        // transitions that happened in the last 90s.
+        const { data, error } = await fetchPrsWithChecks({ force: true });
+        if (error || !data) {
+            if (error) console.error("ci-runs: notify poll fetch failed", error);
+            return;
+        }
+        const { buildStates, jobStates } = collectNotifyStates(data);
+        // Snapshot the previous maps before we overwrite, so the diff sees
+        // the right "before" picture.
+        const prevBuilds = new Map(lastBuildStates);
+        const prevJobs = new Map(lastJobStates);
+        lastBuildStates.clear();
+        for (const [k, v] of buildStates) lastBuildStates.set(k, v);
+        lastJobStates.clear();
+        for (const [k, v] of jobStates) lastJobStates.set(k, v);
+
+        if (!notifyStateSeeded) {
+            notifyStateSeeded = true;
+            return;
+        }
+        if (!activeSession) return;
+        if (!notifyConfig.notifyOnRunCompletion && !notifyConfig.notifyOnJobFailure) return;
+
+        const completions = notifyConfig.notifyOnRunCompletion
+            ? diffNewCompletions(prevBuilds, buildStates) : [];
+        const failures = notifyConfig.notifyOnJobFailure
+            ? diffNewFailures(prevJobs, jobStates) : [];
+        if (completions.length === 0 && failures.length === 0) return;
+        try {
+            await activeSession.send(formatAlertMessage(completions, failures));
+        } catch (err) {
+            console.error("ci-runs: failed to send notify alert", err);
+        }
+    } catch (err) {
+        console.error("ci-runs: notify poll errored", err);
+    } finally {
+        notifyPollInFlight = false;
+    }
+}
+
 const PAGE_HTML = `<!doctype html>
 <html>
 <head>
@@ -892,8 +1180,84 @@ const PAGE_HTML = `<!doctype html>
     .tab { padding: 0.35rem 0.75rem; cursor: pointer; border: none; background: none; color: inherit; font: inherit; border-bottom: 2px solid transparent; }
     .tab.active { border-bottom-color: var(--accent-fg); font-weight: 600; }
     .tab .count { color: var(--fg-muted); font-size: 0.8rem; margin-left: 0.25rem; }
-    button.refresh { cursor: pointer; background: none; border: 1px solid var(--border-default); color: inherit; padding: 0.2rem 0.5rem; border-radius: 4px; font: inherit; font-size: 0.8rem; }
-    button.refresh:hover { background: var(--canvas-subtle); }
+    /* Header icon buttons (settings, refresh). Borderless until hover so they
+       read as toolbar affordances rather than primary actions. */
+    .icon-btn {
+      cursor: pointer;
+      background: none;
+      border: 1px solid transparent;
+      color: var(--fg-muted);
+      padding: 0.4rem 0.55rem;
+      border-radius: 6px;
+      font: inherit;
+      font-size: 1.15rem;
+      line-height: 1;
+      min-width: 2rem;
+      min-height: 2rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .icon-btn:hover { background: var(--canvas-subtle); color: var(--fg-default); }
+    .icon-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+    .icon-btn[aria-expanded="true"] { background: var(--canvas-subtle); color: var(--fg-default); }
+
+    /* Popover menu in the Copilot "Changes" canvas style: sectioned, with
+       single-choice radio rows that show a leading checkmark only when
+       active. Action rows reserve the same checkmark gutter so they align
+       with the radio rows above them. */
+    .menu-anchor { position: relative; display: inline-flex; }
+    .menu {
+      position: absolute;
+      top: calc(100% + 0.35rem);
+      right: 0;
+      z-index: 50;
+      min-width: 220px;
+      max-height: 70vh;
+      overflow-y: auto;
+      padding: 0.35rem;
+      background: var(--canvas-default);
+      border: 1px solid var(--border-default);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+      display: flex;
+      flex-direction: column;
+    }
+    .menu[hidden] { display: none; }
+    .menu-section { display: flex; flex-direction: column; padding: 0.15rem 0; }
+    .menu-section-label {
+      padding: 0.35rem 0.55rem 0.25rem;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--fg-muted);
+    }
+    .menu-divider {
+      border: none;
+      border-top: 1px solid var(--border-default);
+      margin: 0.2rem 0.1rem;
+    }
+    .menu-item {
+      display: grid;
+      grid-template-columns: 1.1rem 1fr;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.4rem 0.55rem;
+      background: none;
+      border: none;
+      color: var(--fg-default);
+      font: inherit;
+      font-size: 0.83rem;
+      text-align: left;
+      cursor: pointer;
+      border-radius: 5px;
+      width: 100%;
+    }
+    .menu-item:hover { background: var(--canvas-subtle); }
+    .menu-item:focus-visible { outline: 2px solid var(--accent-fg); outline-offset: -2px; }
+    .menu-item:disabled { opacity: 0.6; cursor: not-allowed; }
+    .menu-check { display: inline-flex; width: 1rem; justify-content: center; font-size: 0.9rem; visibility: hidden; }
+    .menu-item[aria-checked="true"] { background: var(--canvas-subtle); }
+    .menu-item[aria-checked="true"] .menu-check { visibility: visible; }
     .panel { display: none; }
     .panel.active { display: block; }
     ul.list { list-style: none; padding: 0; margin: 0; }
@@ -966,7 +1330,27 @@ const PAGE_HTML = `<!doctype html>
 <body>
   <header>
     <h1>CI Runs</h1>
-    <button class="refresh" id="refresh">↻ Refresh</button>
+    <button type="button" class="icon-btn" id="refresh" title="Refresh"><span aria-hidden="true">↻</span></button>
+    <div class="menu-anchor">
+      <button type="button" class="icon-btn" id="settings-btn"
+              aria-expanded="false" aria-haspopup="true" aria-controls="settings-menu"
+              title="Settings">
+        <span aria-hidden="true">⚙</span>
+      </button>
+      <div class="menu" id="settings-menu" role="menu" aria-label="CI Runs settings" hidden>
+        <div class="menu-section" role="group" aria-label="Notifications">
+          <div class="menu-section-label">Notifications</div>
+          <button type="button" class="menu-item" id="opt-completion" role="menuitemcheckbox" aria-checked="false">
+            <span class="menu-check" aria-hidden="true">✓</span>
+            <span class="menu-text">Notify on run completion</span>
+          </button>
+          <button type="button" class="menu-item" id="opt-failure" role="menuitemcheckbox" aria-checked="false">
+            <span class="menu-check" aria-hidden="true">✓</span>
+            <span class="menu-text">Notify on job failure</span>
+          </button>
+        </div>
+      </div>
+    </div>
   </header>
   <div class="tabs">
     <button class="tab active" data-tab="copilot">Copilot<span class="count" id="copilot-count"></span></button>
@@ -1388,6 +1772,82 @@ const PAGE_HTML = `<!doctype html>
       await loadAll(true);
     });
 
+    // Settings menu — Copilot "Changes" canvas-style popover anchored to the
+    // gear icon. Two independent checkboxes; both off means no notifications.
+    // The on-disk config is { notifyOnRunCompletion, notifyOnJobFailure } —
+    // both booleans, mirrored here.
+    const settingsBtn = document.getElementById('settings-btn');
+    const settingsMenu = document.getElementById('settings-menu');
+    const optCompletion = document.getElementById('opt-completion');
+    const optFailure = document.getElementById('opt-failure');
+    let currentConfig = { notifyOnRunCompletion: false, notifyOnJobFailure: false };
+
+    function sanitizeCfg(c) {
+      return {
+        notifyOnRunCompletion: !!(c && c.notifyOnRunCompletion),
+        notifyOnJobFailure: !!(c && c.notifyOnJobFailure),
+      };
+    }
+    function syncMenu() {
+      optCompletion.setAttribute('aria-checked', currentConfig.notifyOnRunCompletion ? 'true' : 'false');
+      optFailure.setAttribute('aria-checked', currentConfig.notifyOnJobFailure ? 'true' : 'false');
+    }
+    function openMenu()  { settingsMenu.hidden = false; settingsBtn.setAttribute('aria-expanded', 'true'); }
+    function closeMenu() { settingsMenu.hidden = true;  settingsBtn.setAttribute('aria-expanded', 'false'); }
+
+    settingsBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      settingsMenu.hidden ? openMenu() : closeMenu();
+    });
+    // Clicks inside the menu shouldn't trigger the document-level close.
+    settingsMenu.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', () => { if (!settingsMenu.hidden) closeMenu(); });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !settingsMenu.hidden) {
+        closeMenu();
+        settingsBtn.focus();
+      }
+    });
+
+    async function loadNotifyConfig() {
+      try {
+        const res = await fetch('/api/notify-config');
+        const body = await res.json();
+        if (body && body.config) {
+          currentConfig = sanitizeCfg(body.config);
+          syncMenu();
+        }
+      } catch (e) {
+        console.error('failed to load notify config', e);
+      }
+    }
+    async function saveNotifyConfig() {
+      try {
+        await fetch('/api/notify-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(currentConfig),
+        });
+      } catch (e) {
+        console.error('failed to save notify config', e);
+      }
+    }
+
+    // The two toggles are independent; leave the menu open so the user can
+    // flip both without reopening.
+    optCompletion.addEventListener('click', () => {
+      currentConfig.notifyOnRunCompletion = !currentConfig.notifyOnRunCompletion;
+      syncMenu();
+      saveNotifyConfig();
+    });
+    optFailure.addEventListener('click', () => {
+      currentConfig.notifyOnJobFailure = !currentConfig.notifyOnJobFailure;
+      syncMenu();
+      saveNotifyConfig();
+    });
+
+    loadNotifyConfig();
+
     // Auto-poll every minute. Skip while hidden to spare the GitHub rate limit;
     // refresh immediately on becoming visible if a poll was missed. A flag
     // prevents overlapping refreshes if a previous one is still in flight.
@@ -1474,6 +1934,21 @@ async function startServer() {
                     const { data, cachedAt, error } = await fetchAzdoTimeline({ org, project, buildId, force });
                     jsonResponse(res, { data, cachedAt, error });
                 }
+            } else if (url.pathname === "/api/notify-config") {
+                if (req.method === "GET") {
+                    jsonResponse(res, { config: notifyConfig });
+                } else if (req.method === "POST") {
+                    try {
+                        const body = await readJsonBody(req);
+                        const updated = await saveNotifyConfig(body);
+                        jsonResponse(res, { config: updated });
+                    } catch (err) {
+                        jsonResponse(res, { error: String(err?.message ?? err) }, 400);
+                    }
+                } else {
+                    res.statusCode = 405;
+                    res.end("method not allowed");
+                }
             } else {
                 res.statusCode = 404;
                 res.end("not found");
@@ -1488,10 +1963,10 @@ async function startServer() {
     return { server, url: `http://127.0.0.1:${port}/` };
 }
 
-const session = await joinSession({
+const session = activeSession = await joinSession({
     canvases: [
         createCanvas({
-            id: "pr-pipelines",
+            id: "ci-runs",
             displayName: "CI Runs",
             description:
                 "Side-panel dashboard with two tabs: (1) Copilot sessions currently open in the desktop app with their PR/issue origin; (2) all open pull requests the user authored across GitHub. Cross-links the two so the user can see which of their PRs already have a Copilot session.",
@@ -1540,4 +2015,14 @@ const session = await joinSession({
     ],
 });
 
-await session.log("pr-pipelines extension ready (v0.3)");
+await session.log("ci-runs extension ready (v0.3)");
+
+// Host-side failure-notifier loop. Runs regardless of whether the canvas
+// panel is open, so the user gets alerts even with the side panel closed.
+// The first call seeds state silently; subsequent calls fire session.send()
+// when a build (or job) transitions from non-failure to failure.
+await initNotifyConfig();
+runNotifyPoll().catch((err) => console.error("ci-runs: initial notify poll failed", err));
+setInterval(() => {
+    runNotifyPoll().catch((err) => console.error("ci-runs: notify poll failed", err));
+}, HOST_POLL_INTERVAL_MS);
