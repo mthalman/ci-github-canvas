@@ -47,6 +47,14 @@ const SYNC_STATE_GIT_CONCURRENCY = 4;
 // Each git invocation gets its own timeout in case the worktree is on a
 // slow drive or git wedges on a lock.
 const SYNC_STATE_GIT_TIMEOUT_MS = 5_000;
+// Live PR state lookup. The local DB's PR-state columns can lag the real
+// state on github.com by minutes; this cache stores per-PR live state so
+// closed/merged PRs disappear from the Copilot tab even when the desktop
+// app hasn't synced yet. Closed→merged is sticky so we cache aggressively;
+// errors get a short cache so a transient GraphQL failure doesn't pin the
+// row in a wrong state for long.
+const PR_LIVE_STATE_CACHE_TTL_MS = 5 * 60_000;
+const PR_LIVE_STATE_ERROR_CACHE_TTL_MS = 30_000;
 
 // Parse {org, project} from an AzDO check-run detailsUrl. Returns nulls when
 // the URL doesn't match a known shape (e.g. unexpected legacy collection URL).
@@ -212,6 +220,123 @@ async function enrichSessionsWithSyncState(rows) {
     return rows;
 }
 
+// Per-PR live-state cache: "owner/name#num" (lower) -> { at, state, error }.
+// State is GitHub's PullRequestState enum (OPEN / CLOSED / MERGED) or null
+// if the lookup errored. Used to filter Copilot sessions whose local DB
+// state lags behind GitHub.
+const prLiveStateCache = new Map();
+
+// Extract the set of (owner, name, number) PR refs a session is bound to.
+// A session may track up to two PRs (source / created); both are checked
+// when deciding whether to keep the row.
+function sessionPrRefs(row) {
+    const refs = [];
+    const seen = new Set();
+    for (const [repoFull, num] of [
+        [row.repo_full_name, row.source_pr_number],
+        [row.created_pr_repo, row.created_pr_number],
+    ]) {
+        if (!repoFull || num == null) continue;
+        const slash = repoFull.indexOf("/");
+        if (slash <= 0 || slash === repoFull.length - 1) continue;
+        const owner = repoFull.slice(0, slash);
+        const name = repoFull.slice(slash + 1);
+        const key = `${owner}/${name}#${num}`.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        refs.push({ owner, name, number: Number(num), key });
+    }
+    return refs;
+}
+
+// Fetch live PullRequest.state for a set of PR refs in a single batched
+// GraphQL call (using aliased fields). Returns a Map keyed by "owner/name#num"
+// (lower) -> { state, error }. Results are cached; only cache-misses (or
+// expired entries) are queried.
+async function fetchLivePrStates(refs) {
+    const now = Date.now();
+    const result = new Map();
+    const toQuery = [];
+    for (const ref of refs) {
+        const cached = prLiveStateCache.get(ref.key);
+        const ttl = cached?.error ? PR_LIVE_STATE_ERROR_CACHE_TTL_MS : PR_LIVE_STATE_CACHE_TTL_MS;
+        if (cached && now - cached.at < ttl) {
+            result.set(ref.key, cached);
+        } else {
+            toQuery.push(ref);
+        }
+    }
+    if (toQuery.length === 0) return result;
+
+    // Build one GraphQL query with aliased fields so all lookups go in a
+    // single round-trip. JSON.stringify handles escaping for owner/name.
+    const fields = toQuery
+        .map(
+            (ref, i) =>
+                `  pr${i}: repository(owner: ${JSON.stringify(ref.owner)}, name: ${JSON.stringify(ref.name)}) { pullRequest(number: ${ref.number}) { state } }`,
+        )
+        .join("\n");
+    const query = `query {\n${fields}\n}`;
+
+    const gqlResult = await runGh(["api", "graphql", "--field", `query=${query}`]);
+    if (gqlResult.error) {
+        // Cache the error per-ref so we don't spam gh on every poll.
+        for (const ref of toQuery) {
+            const entry = { at: now, state: null, error: gqlResult.error };
+            prLiveStateCache.set(ref.key, entry);
+            result.set(ref.key, entry);
+        }
+        return result;
+    }
+    // GraphQL may return partial data with per-field errors (e.g. unknown
+    // repo / SAML). We still want successful lookups to apply; missing fields
+    // get a null state which the caller treats as "no signal".
+    const data = gqlResult.data?.data ?? {};
+    toQuery.forEach((ref, i) => {
+        const state = data?.[`pr${i}`]?.pullRequest?.state ?? null;
+        const entry = { at: now, state, error: state ? null : "no data" };
+        prLiveStateCache.set(ref.key, entry);
+        result.set(ref.key, entry);
+    });
+    return result;
+}
+
+// Drop session rows whose every associated PR is CLOSED or MERGED according
+// to live GitHub state. Rows whose PR can't be resolved (errors, missing
+// data) are kept — we err toward showing rather than hiding stale state.
+async function filterSessionsByLivePrState(rows) {
+    if (!Array.isArray(rows) || !rows.length) return rows;
+    const allRefs = [];
+    const refsByRow = new Array(rows.length);
+    const seen = new Set();
+    for (let i = 0; i < rows.length; i++) {
+        const refs = sessionPrRefs(rows[i]);
+        refsByRow[i] = refs;
+        for (const ref of refs) {
+            if (seen.has(ref.key)) continue;
+            seen.add(ref.key);
+            allRefs.push(ref);
+        }
+    }
+    if (allRefs.length === 0) return rows;
+    const states = await fetchLivePrStates(allRefs);
+    return rows.filter((_, i) => {
+        const refs = refsByRow[i];
+        if (!refs.length) return true; // no PR refs — shouldn't happen given SQL filter
+        let sawSignal = false;
+        for (const ref of refs) {
+            const entry = states.get(ref.key);
+            if (!entry || entry.error) continue; // no usable signal for this ref
+            sawSignal = true;
+            if (entry.state === "OPEN") return true;
+        }
+        // No PR was confirmed OPEN. Drop only if we got at least one
+        // confirmed CLOSED/MERGED signal; otherwise keep (live lookup
+        // gave us no useful data, fall back to local DB state).
+        return !sawSignal;
+    });
+}
+
 // One row per non-archived workspace. PR / issue fields are coalesced from
 // both `workspaces` (older shape) and `workspace_repo_contexts` (newer shape)
 // so we work on either app version.
@@ -269,11 +394,24 @@ function fetchCopilotSessions() {
         LEFT JOIN projects p                ON p.id = w.project_id
         LEFT JOIN workspace_repo_contexts c ON c.workspace_id = w.id
         WHERE w.archived_at IS NULL
+          -- Show the row only if at least one associated PR is still "active"
+          -- (state is unknown / open / draft). PRs the Copilot app has synced
+          -- as 'closed' or 'merged' shouldn't keep the session visible after
+          -- the underlying work is done. State values in this DB are stored
+          -- lowercase ('open', 'merged', 'closed'); LOWER() is defensive.
           AND (
-                w.source_pr_number  IS NOT NULL
-             OR w.created_pr_number IS NOT NULL
-             OR c.source_pr_number  IS NOT NULL
-             OR c.created_pr_number IS NOT NULL
+                (w.source_pr_number  IS NOT NULL
+                  AND (w.source_pr_state  IS NULL
+                       OR LOWER(w.source_pr_state)  NOT IN ('closed','merged')))
+             OR (w.created_pr_number IS NOT NULL
+                  AND (w.created_pr_state IS NULL
+                       OR LOWER(w.created_pr_state) NOT IN ('closed','merged')))
+             OR (c.source_pr_number  IS NOT NULL
+                  AND (c.source_pr_state  IS NULL
+                       OR LOWER(c.source_pr_state)  NOT IN ('closed','merged')))
+             OR (c.created_pr_number IS NOT NULL
+                  AND (c.created_pr_state IS NULL
+                       OR LOWER(c.created_pr_state) NOT IN ('closed','merged')))
           )
         ORDER BY datetime(w.updated_at) DESC
     `;
@@ -1260,8 +1398,12 @@ async function startServer() {
                 if (rows && rows.__error) {
                     jsonResponse(res, { error: rows.__error });
                 } else {
-                    await enrichSessionsWithSyncState(rows);
-                    jsonResponse(res, { rows });
+                    // Drop sessions whose PRs are closed/merged on github.com,
+                    // even if the local DB hasn't synced that state yet. Then
+                    // attach the per-checkout sync badge.
+                    const liveFiltered = await filterSessionsByLivePrState(rows);
+                    await enrichSessionsWithSyncState(liveFiltered);
+                    jsonResponse(res, { rows: liveFiltered });
                 }
             } else if (url.pathname === "/api/prs") {
                 const force = url.searchParams.get("force") === "1";
@@ -1321,7 +1463,10 @@ const session = await joinSession({
                     name: "refresh",
                     description: "Re-read the local session store and re-fetch the user's open PRs from GitHub.",
                     handler: async () => {
-                        const sessions = fetchCopilotSessions();
+                        const rawSessions = fetchCopilotSessions();
+                        const sessions = (rawSessions && rawSessions.__error)
+                            ? rawSessions
+                            : await filterSessionsByLivePrState(rawSessions);
                         const checks = await fetchPrsWithChecks({ force: true });
                         return {
                             ok: !checks.error && !(sessions && sessions.__error),
@@ -1340,7 +1485,10 @@ const session = await joinSession({
                     entry = await startServer();
                     servers.set(ctx.instanceId, entry);
                 }
-                const rows = fetchCopilotSessions();
+                const rawRows = fetchCopilotSessions();
+                const rows = (rawRows && rawRows.__error)
+                    ? rawRows
+                    : await filterSessionsByLivePrState(rawRows);
                 const sessionCount = Array.isArray(rows) ? rows.length : 0;
                 return { title: "CI Runs", url: entry.url, status: `${sessionCount} active session${sessionCount === 1 ? "" : "s"}` };
             },
