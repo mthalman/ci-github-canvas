@@ -670,54 +670,98 @@ const PAGE_HTML = `<!doctype html>
   <meta charset="utf-8" />
   <title>CI Runs</title>
   <style>
-    :root { color-scheme: light dark; }
-    body { font: 14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; padding: 1rem; }
+    /* Semantic Primer-aligned color tokens. The canvas iframe is cross-origin
+       so we can't read CSS variables from the host frame; instead we mirror
+       GitHub Primer's light/dark palettes and switch via prefers-color-scheme.
+       All visual colors below are expressed in terms of these tokens so the
+       canvas reskins cleanly when the system theme changes. */
+    :root {
+      color-scheme: light dark;
+      /* Light mode (Primer light) */
+      --canvas-default:  #ffffff;
+      --canvas-subtle:   #f6f8fa;
+      --fg-default:      #1f2328;
+      --fg-muted:        #59636e;
+      --fg-subtle:       #818b98;
+      --border-default:  #d1d9e0;
+      --border-muted:    #d1d9e0b3;
+      --accent-fg:       #0969da;
+      --success-fg:      #1a7f37;
+      --attention-fg:    #9a6700;
+      --danger-fg:       #d1242f;
+      --done-fg:         #8250df;
+      --neutral-fg:      #59636e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --canvas-default:  #0d1117;
+        --canvas-subtle:   #161b22;
+        --fg-default:      #f0f6fc;
+        --fg-muted:        #9198a1;
+        --fg-subtle:       #6e7681;
+        --border-default:  #3d444d;
+        --border-muted:    #3d444db3;
+        --accent-fg:       #4493f7;
+        --success-fg:      #3fb950;
+        --attention-fg:    #d29922;
+        --danger-fg:       #f85149;
+        --done-fg:         #a371f7;
+        --neutral-fg:      #9198a1;
+      }
+    }
+
+    body { font: 14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; margin: 0; padding: 1rem; background: var(--canvas-default); color: var(--fg-default); }
     header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
     h1 { margin: 0; font-size: 1.1rem; flex: 1; }
-    .tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); margin-bottom: 0.75rem; }
+    .tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--border-default); margin-bottom: 0.75rem; }
     .tab { padding: 0.35rem 0.75rem; cursor: pointer; border: none; background: none; color: inherit; font: inherit; border-bottom: 2px solid transparent; }
-    .tab.active { border-bottom-color: #1f6feb; font-weight: 600; }
-    .tab .count { color: #888; font-size: 0.8rem; margin-left: 0.25rem; }
-    button.refresh { cursor: pointer; background: none; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); color: inherit; padding: 0.2rem 0.5rem; border-radius: 4px; font: inherit; font-size: 0.8rem; }
+    .tab.active { border-bottom-color: var(--accent-fg); font-weight: 600; }
+    .tab .count { color: var(--fg-muted); font-size: 0.8rem; margin-left: 0.25rem; }
+    button.refresh { cursor: pointer; background: none; border: 1px solid var(--border-default); color: inherit; padding: 0.2rem 0.5rem; border-radius: 4px; font: inherit; font-size: 0.8rem; }
+    button.refresh:hover { background: var(--canvas-subtle); }
     .panel { display: none; }
     .panel.active { display: block; }
     ul.list { list-style: none; padding: 0; margin: 0; }
-    li.row { border: 1px solid color-mix(in srgb, currentColor 15%, transparent); border-radius: 6px; padding: 0.6rem 0.75rem; margin-bottom: 0.5rem; }
+    li.row { border: 1px solid var(--border-default); border-radius: 6px; padding: 0.6rem 0.75rem; margin-bottom: 0.5rem; background: var(--canvas-default); }
     .row-head { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; font-size: 0.85rem; }
     .row-title { font-weight: 600; margin-top: 0.25rem; }
-    .row-meta { color: #888; font-size: 0.8rem; margin-top: 0.15rem; font-family: ui-monospace, Consolas, monospace; }
+    .row-meta { color: var(--fg-muted); font-size: 0.8rem; margin-top: 0.15rem; font-family: ui-monospace, Consolas, monospace; }
     .project, .repo, .badge { padding: 0.05rem 0.4rem; border-radius: 999px; font-size: 0.7rem; }
-    .project { background: color-mix(in srgb, currentColor 8%, transparent); font-size: 0.75rem; }
-    .repo { color: #888; font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; background: none; padding: 0; }
+    .project { background: var(--canvas-subtle); font-size: 0.75rem; }
+    .repo { color: var(--fg-muted); font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; background: none; padding: 0; }
     .badge { text-transform: uppercase; letter-spacing: 0.03em; }
-    .badge.draft   { background: rgba(139,148,158,0.25); color: #8b949e; }
-    .badge.session { background: rgba(210,153,34,0.2); color: #d29922; }
-    .badge.closed  { background: rgba(248,81,73,0.2); color: #f85149; }
-    .badge.merged  { background: rgba(163,113,247,0.2); color: #a371f7; }
-    .badge.sync-up_to_date { background: rgba(46,160,67,0.15); color: #2ea043; }
-    .badge.sync-behind     { background: rgba(210,153,34,0.2); color: #d29922; }
-    .badge.sync-ahead      { background: rgba(31,111,235,0.2); color: #1f6feb; }
-    .badge.sync-diverged   { background: rgba(248,81,73,0.2); color: #f85149; }
+    /* Badge backgrounds are derived from their fg token via color-mix so the
+       tinted fill tracks the same hue when the theme switches. */
+    .badge.draft   { background: color-mix(in srgb, var(--neutral-fg)   25%, transparent); color: var(--neutral-fg); }
+    .badge.session { background: color-mix(in srgb, var(--attention-fg) 20%, transparent); color: var(--attention-fg); }
+    .badge.closed  { background: color-mix(in srgb, var(--danger-fg)    20%, transparent); color: var(--danger-fg); }
+    .badge.merged  { background: color-mix(in srgb, var(--done-fg)      20%, transparent); color: var(--done-fg); }
+    .badge.sync-up_to_date { background: color-mix(in srgb, var(--success-fg)   15%, transparent); color: var(--success-fg); }
+    .badge.sync-behind     { background: color-mix(in srgb, var(--attention-fg) 20%, transparent); color: var(--attention-fg); }
+    .badge.sync-ahead      { background: color-mix(in srgb, var(--accent-fg)    20%, transparent); color: var(--accent-fg); }
+    .badge.sync-diverged   { background: color-mix(in srgb, var(--danger-fg)    20%, transparent); color: var(--danger-fg); }
     .azdo { margin-top: 0.4rem; display: flex; flex-direction: column; gap: 0.25rem; }
     .azdo-build { display: flex; flex-direction: column; gap: 0.15rem; }
     .azdo-line { display: flex; gap: 0.4rem; align-items: center; font-size: 0.8rem; flex-wrap: wrap; }
-    .azdo-line .label { color: #888; }
+    .azdo-line .label { color: var(--fg-muted); }
+    .azdo-line .count-fail { color: var(--danger-fg); }
+    .azdo-line .count-progress { color: var(--attention-fg); }
     .ci-dot { width: 0.65rem; height: 0.65rem; border-radius: 50%; display: inline-block; }
-    .ci-dot.success     { background: #2ea043; }
-    .ci-dot.failure     { background: #f85149; }
-    .ci-dot.in_progress { background: #d29922; animation: pulse 1.6s ease-in-out infinite; }
-    .ci-dot.other       { background: #8b949e; }
+    .ci-dot.success     { background: var(--success-fg); }
+    .ci-dot.failure     { background: var(--danger-fg); }
+    .ci-dot.in_progress { background: var(--attention-fg); animation: pulse 1.6s ease-in-out infinite; }
+    .ci-dot.other       { background: var(--neutral-fg); }
     @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:0.35 } }
-    .toggle { cursor: pointer; background: none; border: none; color: #1f6feb; font: inherit; font-size: 0.8rem; padding: 0; }
+    .toggle { cursor: pointer; background: none; border: none; color: var(--accent-fg); font: inherit; font-size: 0.8rem; padding: 0; }
     .toggle:hover { text-decoration: underline; }
     details.azdo-jobs { margin-top: 0.2rem; }
-    details.azdo-jobs summary { cursor: pointer; font-size: 0.75rem; color: #888; list-style: revert; }
+    details.azdo-jobs summary { cursor: pointer; font-size: 0.75rem; color: var(--fg-muted); list-style: revert; }
     details.azdo-jobs ul { list-style: none; padding-left: 1rem; margin: 0.25rem 0 0; }
     details.azdo-jobs li { font-size: 0.75rem; font-family: ui-monospace, Consolas, monospace; padding: 0.1rem 0; display: flex; gap: 0.4rem; align-items: center; }
     .azdo-timeline { margin: 0.25rem 0 0; }
-    .azdo-timeline .tl-fallback-note { color: #d29922; font-size: 0.7rem; padding: 0.2rem 0; }
-    .azdo-timeline .tl-loading { color: #888; font-size: 0.75rem; padding: 0.2rem 0; }
-    .azdo-timeline .tl-error { color: #f85149; font-size: 0.75rem; padding: 0.2rem 0; white-space: pre-wrap; }
+    .azdo-timeline .tl-fallback-note { color: var(--attention-fg); font-size: 0.7rem; padding: 0.2rem 0; }
+    .azdo-timeline .tl-loading { color: var(--fg-muted); font-size: 0.75rem; padding: 0.2rem 0; }
+    .azdo-timeline .tl-error { color: var(--danger-fg); font-size: 0.75rem; padding: 0.2rem 0; white-space: pre-wrap; }
 
     /* Collapsible PR rows. Default-open unless every CI check passed. */
     li.row-collapsible { padding: 0; }
@@ -729,7 +773,7 @@ const PAGE_HTML = `<!doctype html>
     li.row-collapsible > details > summary::-webkit-details-marker { display: none; }
     li.row-collapsible > details > summary::marker { content: ''; }
     li.row-collapsible .caret {
-      flex: 0 0 auto; color: #888; font-size: 0.7rem; line-height: 1.5;
+      flex: 0 0 auto; color: var(--fg-muted); font-size: 0.7rem; line-height: 1.5;
       transition: transform 0.15s ease;
       transform: rotate(0deg);
       width: 0.7rem;
@@ -738,10 +782,10 @@ const PAGE_HTML = `<!doctype html>
     li.row-collapsible .row-summary-content { flex: 1 1 auto; min-width: 0; }
     li.row-collapsible > details > .row-body { padding: 0 0.75rem 0.6rem 1.95rem; }
     li.row-collapsible .ci-dot.overall { width: 0.7rem; height: 0.7rem; margin-left: auto; }
-    a { color: #1f6feb; text-decoration: none; }
+    a { color: var(--accent-fg); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .empty, .error, .loading { color: #888; padding: 1rem; text-align: center; }
-    .error { color: #f85149; text-align: left; white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; }
+    .empty, .error, .loading { color: var(--fg-muted); padding: 1rem; text-align: center; }
+    .error { color: var(--danger-fg); text-align: left; white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; }
   </style>
 </head>
 <body>
@@ -856,8 +900,8 @@ const PAGE_HTML = `<!doctype html>
       const overallDot = '<span class="ci-dot ' + s.overall + '"></span>';
       const counts = [
         s.success     ? \`<span title="passed">✓ \${s.success}</span>\` : '',
-        s.failure     ? \`<span title="failed" style="color:#f85149">✕ \${s.failure}</span>\` : '',
-        s.inProgress  ? \`<span title="in progress" style="color:#d29922">⟳ \${s.inProgress}</span>\` : '',
+        s.failure     ? \`<span title="failed" class="count-fail">✕ \${s.failure}</span>\` : '',
+        s.inProgress  ? \`<span title="in progress" class="count-progress">⟳ \${s.inProgress}</span>\` : '',
         s.other       ? \`<span title="other">· \${s.other}</span>\` : '',
       ].filter(Boolean).join(' ');
       const buildLines = azdo.builds.map(b => {
@@ -890,8 +934,8 @@ const PAGE_HTML = `<!doctype html>
       const overallDot = '<span class="ci-dot ' + s.overall + '"></span>';
       const counts = [
         s.success     ? \`<span title="passed">✓ \${s.success}</span>\` : '',
-        s.failure     ? \`<span title="failed" style="color:#f85149">✕ \${s.failure}</span>\` : '',
-        s.inProgress  ? \`<span title="in progress" style="color:#d29922">⟳ \${s.inProgress}</span>\` : '',
+        s.failure     ? \`<span title="failed" class="count-fail">✕ \${s.failure}</span>\` : '',
+        s.inProgress  ? \`<span title="in progress" class="count-progress">⟳ \${s.inProgress}</span>\` : '',
         s.other       ? \`<span title="other">· \${s.other}</span>\` : '',
       ].filter(Boolean).join(' ');
       const jobs = gha.runs.map(r => \`<li><span class="ci-dot \${runDotClass(r)}"></span><a href="\${esc(r.detailsUrl)}" target="_blank" rel="noopener">\${esc(r.name)}</a> <span class="label">\${esc(runStatusLabel(r))}</span></li>\`).join('');
