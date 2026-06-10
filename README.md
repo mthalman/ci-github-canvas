@@ -15,12 +15,16 @@ PRs that appear in both tabs get an `in session` badge in the "All my PRs" view 
 
 ## Install
 
-User-scoped (works across all your Copilot projects):
+User-scoped (works across all your Copilot projects). The extension is a
+multi-file layout (`extension.mjs` + `lib/*.mjs`), so make sure you copy
+the whole folder, not just `extension.mjs`:
 
 ```powershell
 # From the directory containing this README
-New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\.copilot\extensions\ci-runs" | Out-Null
-Copy-Item .\extension.mjs "$env:USERPROFILE\.copilot\extensions\ci-runs\extension.mjs" -Force
+$dest = "$env:USERPROFILE\.copilot\extensions\ci-runs"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Copy-Item .\extension.mjs $dest -Force
+Copy-Item .\lib           $dest -Recurse -Force
 ```
 
 Then, inside any Copilot CLI session, reload extensions:
@@ -41,6 +45,15 @@ install_extension({
 })
 ```
 
+`install_extension` clones the whole repo (including the `lib/` folder), so
+this works for the multi-file layout.
+
+> **Note on `share_extension`:** the `share_extension` tool publishes the
+> extension folder as a flat GitHub gist, which can't represent
+> subdirectories. The `lib/` modules would be silently dropped, so
+> `share_extension` is no longer a supported install path for this extension.
+> Use `install_extension` with the repo URL above instead.
+
 ## Local development
 
 If you're hacking on this extension, the copy-on-every-change loop above gets
@@ -52,8 +65,9 @@ the next `extensions_reload` (or session restart):
 pwsh .\install-dev-link.ps1
 ```
 
-Edit `extension.mjs` in the repo, then ask the agent to **reload extensions**.
-No file copy step.
+Edit `extension.mjs` (the thin canvas-wiring shell) or any module under
+`lib/` in the repo, then ask the agent to **reload extensions**. No file
+copy step.
 
 To remove the symlink:
 
@@ -80,24 +94,27 @@ The agent will open the `ci-runs` canvas in a side panel. From there:
 ## Architecture
 
 ```
-┌──────────────────────────────────┐
-│  extension.mjs (forked process)  │
-│                                  │
-│  joinSession({ canvases: [...] })│
-│           │                      │
-│   canvas.open()                  │
-│           │                      │
-│   ▼                              │
-│   local HTTP server (ephemeral   │
-│   port on 127.0.0.1)             │
-│           │                      │
-│   ├── /api/sessions  ──► node:sqlite ──► ~/.copilot/data.db
-│   └── /api/prs-with-checks ──► spawn `gh api graphql` ──► GitHub
-│                                  │
-│   ▼                              │
-│   single-page dashboard (vanilla │
-│   HTML/JS, no framework)         │
-└──────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│  extension.mjs  (thin SDK-wiring shell)   │
+│  - joinSession({ canvases: [...] })       │
+│  - canvas.open() → startServer() per panel│
+│  - host-side notify poll loop             │
+└───────────────────────────────────────────┘
+             │ imports
+             ▼
+┌───────────────────────────────────────────┐
+│  lib/                                     │
+│   constants.mjs   TTLs, regexes, paths    │
+│   page.mjs        single-page HTML/JS UI  │
+│   sessions.mjs    node:sqlite → data.db   │
+│   github.mjs      spawn `gh api graphql`  │
+│   azdo.mjs        AzDO timeline fetch     │
+│   gha.mjs         GHA check-run summary   │
+│   git-sync.mjs    worktree sync badges    │
+│   notify.mjs      run-completion / fail   │
+│                   alerts via session.send │
+│   server.mjs      127.0.0.1 HTTP routes   │
+└───────────────────────────────────────────┘
 ```
 
 - **Sessions** come from `~/.copilot/data.db` (`workspaces` + `workspace_repo_contexts` + `workspace_pr_sync_status` tables), opened read-only via `node:sqlite`.
