@@ -79,6 +79,21 @@ pwsh .\uninstall-dev-link.ps1
 > Developer Mode (Settings &rarr; For developers). Without it, run the install
 > script from an elevated PowerShell prompt.
 
+### Tests
+
+Unit tests for everything under `lib/` live in `test/` and use Node's
+built-in test runner — no `npm install` step. With Node 24+:
+
+```powershell
+npm test
+# or, equivalently:
+node --test test/*.test.mjs
+```
+
+CI runs the same command on push and pull-request via
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) across Linux, macOS,
+and Windows on Node 24 and 25.
+
 ## Usage
 
 Ask the agent something like:
