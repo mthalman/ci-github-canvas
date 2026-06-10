@@ -25,17 +25,20 @@ if (-not (Test-Path $targetDir)) {
 
 # Refuse to remove if the folder contains anything we didn't put there —
 # we only want to clean up our own dev link, not nuke a hand-installed copy.
+# The install script creates two symlinks: extension.mjs and lib/.
 $entries = Get-ChildItem -Force $targetDir
-$ourFile = Join-Path $targetDir 'extension.mjs'
-$onlyOurs =
-    $entries.Count -eq 1 -and
-    $entries[0].FullName -eq $ourFile -and
-    $entries[0].LinkType -in @('SymbolicLink', 'Junction')
+$expectedNames = @('extension.mjs', 'lib')
+$onlyOurs = $true
+foreach ($e in $entries) {
+    if ($e.Name -notin $expectedNames) { $onlyOurs = $false; break }
+    if ($e.LinkType -notin @('SymbolicLink', 'Junction')) { $onlyOurs = $false; break }
+}
+if ($onlyOurs -and $entries.Count -gt $expectedNames.Count) { $onlyOurs = $false }
 
 if (-not $onlyOurs) {
     Write-Error @"
-Refusing to remove $targetDir — it contains files other than the dev-link symlink
-(or extension.mjs is a regular file, not a symlink).
+Refusing to remove $targetDir — it contains files other than the dev-link symlinks
+(expected: extension.mjs symlink and lib symlink only).
 
 Remove it manually if you're sure:
   Remove-Item -Recurse -Force '$targetDir'
