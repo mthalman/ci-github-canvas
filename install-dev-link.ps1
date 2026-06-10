@@ -119,7 +119,7 @@ New-DevSymlink -LinkPath $targetLibDir -TargetPath $sourceLibDir -ForceReplace:$
 
 Write-Host ""
 Write-Host ""
-Write-Host "Reload extensions in any running Copilot CLI session to activate:" -ForegroundColor Cyan
-Write-Host "  /reload-extensions"
+Write-Host "Reload extensions in any running GitHub Copilot app session to activate:" -ForegroundColor Cyan
+Write-Host "  Ask the agent: 'reload extensions'"
 Write-Host ""
-Write-Host "Or ask the agent: 'reload extensions'."
+Write-Host "Or just restart the session."

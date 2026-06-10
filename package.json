@@ -1,7 +1,7 @@
 {
   "name": "ci-github-canvas",
   "version": "0.3.0",
-  "description": "GitHub Copilot CLI canvas extension surfacing PR CI runs (Azure Pipelines + GitHub Actions).",
+  "description": "GitHub Copilot app canvas extension surfacing PR CI runs (Azure Pipelines + GitHub Actions).",
   "private": true,
   "type": "module",
   "engines": {
