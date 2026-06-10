@@ -13,6 +13,17 @@ test("constants: paths are absolute strings", () => {
     assert.ok(C.NOTIFY_CONFIG_PATH.endsWith("ci-runs.json"));
 });
 
+test("constants: notify config lives under the extension's artifacts/ dir", () => {
+    assert.equal(typeof C.EXTENSION_ROOT, "string");
+    assert.equal(typeof C.ARTIFACTS_DIR, "string");
+    assert.ok(C.ARTIFACTS_DIR.startsWith(C.EXTENSION_ROOT),
+        "ARTIFACTS_DIR should live under EXTENSION_ROOT");
+    assert.ok(C.ARTIFACTS_DIR.endsWith("artifacts"),
+        "ARTIFACTS_DIR should be named 'artifacts'");
+    assert.ok(C.NOTIFY_CONFIG_PATH.startsWith(C.ARTIFACTS_DIR),
+        "NOTIFY_CONFIG_PATH should live under ARTIFACTS_DIR");
+});
+
 test("constants: TTLs are positive numbers", () => {
     for (const k of [
         "GH_CACHE_TTL_MS",

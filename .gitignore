@@ -13,3 +13,9 @@ Thumbs.db
 
 # Local dev artifacts
 *.log
+
+# Per-extension scratch / config dir. Populated at runtime under the
+# extension's install location; when this repo is dev-linked into the
+# Copilot extensions dir the file lands here, but it's user-local state
+# and should never be committed.
+artifacts/
