@@ -82,13 +82,24 @@ test("summarizeAzdoRuns: in_progress wins when there are no failures", () => {
     assert.equal(got.summary.overall, "in_progress");
 });
 
-test("summarizeAzdoRuns: SKIPPED/NEUTRAL count as success", () => {
+test("summarizeAzdoRuns: SKIPPED/NEUTRAL count as skipped (not success)", () => {
     const runs = [
         { name: "a", detailsUrl: "https://dev.azure.com/o/p/_build/results?buildId=9", status: "COMPLETED", conclusion: "SKIPPED" },
         { name: "b", detailsUrl: "https://dev.azure.com/o/p/_build/results?buildId=9", status: "COMPLETED", conclusion: "NEUTRAL" },
     ];
     const got = summarizeAzdoRuns(runs);
-    assert.equal(got.summary.success, 2);
+    assert.equal(got.summary.success, 0);
+    assert.equal(got.summary.skipped, 2);
+    assert.equal(got.summary.overall, "skipped");
+});
+
+test("summarizeAzdoRuns: success outranks skipped for overall", () => {
+    const got = summarizeAzdoRuns([
+        { name: "a", detailsUrl: "https://dev.azure.com/o/p/_build/results?buildId=9", status: "COMPLETED", conclusion: "SUCCESS" },
+        { name: "b", detailsUrl: "https://dev.azure.com/o/p/_build/results?buildId=9", status: "COMPLETED", conclusion: "SKIPPED" },
+    ]);
+    assert.equal(got.summary.success, 1);
+    assert.equal(got.summary.skipped, 1);
     assert.equal(got.summary.overall, "success");
 });
 
@@ -109,12 +120,46 @@ test("summarizeAzdoRuns: unknown conclusion counted as 'other'", () => {
     assert.equal(got.summary.overall, "other");
 });
 
-test("summarizeAzdoRuns: URL without buildId still grouped (by origin)", () => {
+test("summarizeAzdoRuns: URL without buildId grouped per definition URL", () => {
     const got = summarizeAzdoRuns([
         { name: "x", detailsUrl: "https://dev.azure.com/o/p/some/other/path", status: "COMPLETED", conclusion: "SUCCESS" },
     ]);
     assert.equal(got.builds.length, 1);
     assert.equal(got.builds[0].buildId, null);
+});
+
+test("summarizeAzdoRuns: distinct definition URLs without buildId stay separate", () => {
+    const got = summarizeAzdoRuns([
+        { name: "pipe-a", detailsUrl: "https://dev.azure.com/o/p/_build/definition?definitionId=1", status: "COMPLETED", conclusion: "NEUTRAL" },
+        { name: "pipe-b", detailsUrl: "https://dev.azure.com/o/p/_build/definition?definitionId=2", status: "COMPLETED", conclusion: "NEUTRAL" },
+    ]);
+    assert.equal(got.builds.length, 2);
+    assert.ok(got.builds.every((b) => b.buildId === null));
+});
+
+test("summarizeAzdoRuns: definition-only build gets a GitHub checks deep-link from prUrl", () => {
+    const got = summarizeAzdoRuns(
+        [
+            { name: "dotnet-unified-build", detailsUrl: "https://dev.azure.com/o/p/_build/definition?definitionId=278", status: "COMPLETED", conclusion: "NEUTRAL", databaseId: 81456047644 },
+        ],
+        { prUrl: "https://github.com/dotnet/dotnet/pull/7085" },
+    );
+    assert.equal(got.builds.length, 1);
+    assert.equal(got.builds[0].buildId, null);
+    assert.equal(got.builds[0].githubUrl, "https://github.com/dotnet/dotnet/pull/7085/checks?check_run_id=81456047644");
+});
+
+test("summarizeAzdoRuns: no githubUrl when prUrl absent or no databaseId", () => {
+    const noPrUrl = summarizeAzdoRuns([
+        { name: "pipe", detailsUrl: "https://dev.azure.com/o/p/_build/definition?definitionId=1", status: "COMPLETED", conclusion: "NEUTRAL", databaseId: 99 },
+    ]);
+    assert.equal(noPrUrl.builds[0].githubUrl, null);
+
+    const noId = summarizeAzdoRuns(
+        [{ name: "pipe", detailsUrl: "https://dev.azure.com/o/p/_build/definition?definitionId=1", status: "COMPLETED", conclusion: "NEUTRAL" }],
+        { prUrl: "https://github.com/o/r/pull/1" },
+    );
+    assert.equal(noId.builds[0].githubUrl, null);
 });
 
 // --- fetchAzdoTimeline -----------------------------------------------------
