@@ -187,6 +187,18 @@ test("rejects cross-origin write via Origin header with 403 (CSRF guard)", async
     assert.equal(r.status, 403);
 });
 
+test("rejects cross-port Origin write with 403 (CSRF guard)", async () => {
+    // Same loopback hostname but a different port is still a different origin
+    // and must be blocked for state-changing requests.
+    const r = await rawRequest({
+        method: "POST",
+        path: "/api/watched",
+        headers: { Host: `127.0.0.1:${port}`, "Content-Type": "application/json", Origin: `http://127.0.0.1:${port + 1}` },
+        body: JSON.stringify({ url: "https://github.com/o/r/pull/1" }),
+    });
+    assert.equal(r.status, 403);
+});
+
 test("allows same-origin write (loopback Origin) past the CSRF guard", async () => {
     // Bad body so it 400s inside the handler — the point is it is NOT 403'd.
     const r = await rawRequest({
