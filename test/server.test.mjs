@@ -81,3 +81,53 @@ test("GET /api/azdo-timeline accepts well-formed params (network attempt allowed
     const body = await r.json();
     assert.ok("data" in body || "error" in body);
 });
+
+// --- /api/watched ----------------------------------------------------------
+
+test("GET /api/watched returns an items array (may be non-empty if user has watched PRs)", async () => {
+    const r = await fetch(`${baseUrl}/api/watched`);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.ok(Array.isArray(body.items));
+    assert.ok(Array.isArray(body.rows));
+});
+
+test("POST /api/watched rejects malformed URLs with 400", async () => {
+    const r = await fetch(`${baseUrl}/api/watched`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: "not a url" }),
+    });
+    assert.equal(r.status, 400);
+    const body = await r.json();
+    assert.match(body.error ?? "", /valid GitHub PR URL/i);
+});
+
+test("POST /api/watched rejects empty body with 400", async () => {
+    const r = await fetch(`${baseUrl}/api/watched`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+    });
+    assert.equal(r.status, 400);
+});
+
+test("DELETE /api/watched without key returns 400", async () => {
+    const r = await fetch(`${baseUrl}/api/watched`, { method: "DELETE" });
+    assert.equal(r.status, 400);
+    const body = await r.json();
+    assert.match(body.error ?? "", /key/i);
+});
+
+test("DELETE /api/watched with unknown key returns 200 removed=false", async () => {
+    const r = await fetch(`${baseUrl}/api/watched?key=zz%2Fzz%23999999`, { method: "DELETE" });
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.removed, false);
+    assert.ok(Array.isArray(body.items));
+});
+
+test("PUT /api/watched → 405", async () => {
+    const r = await fetch(`${baseUrl}/api/watched`, { method: "PUT" });
+    assert.equal(r.status, 405);
+});
