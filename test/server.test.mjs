@@ -8,7 +8,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
 
-import { startServer } from "../lib/server.mjs";
+import { startServer, sendServerError } from "../lib/server.mjs";
 
 let server;
 let baseUrl;
@@ -211,9 +211,28 @@ test("allows same-origin write (loopback Origin) past the CSRF guard", async () 
 });
 
 test("500 handler does not leak a stack trace", async () => {
-    // A bare CONNECT-style odd method on a known path still routes through the
-    // handler; we mainly assert no <pre>/stack is ever returned on error paths.
-    const r = await rawRequest({ path: "/api/notify-config", headers: { Host: `127.0.0.1:${port}` } });
-    assert.doesNotMatch(r.body, /<pre>/);
-    assert.doesNotMatch(r.body, /at Server\./);
+    // Drive the real error responder with an error that carries a stack and a
+    // local filesystem path, and assert neither is reflected to the caller.
+    const err = new Error("boom at C:\\repos\\secret\\path.mjs");
+    const chunks = [];
+    const headers = {};
+    const fakeRes = {
+        statusCode: 200,
+        setHeader(k, v) { headers[k.toLowerCase()] = v; },
+        end(body) { if (body != null) chunks.push(String(body)); },
+    };
+    const origConsoleError = console.error;
+    console.error = () => {}; // suppress the intentional local error log
+    try {
+        sendServerError(fakeRes, err);
+    } finally {
+        console.error = origConsoleError;
+    }
+    const body = chunks.join("");
+    assert.equal(fakeRes.statusCode, 500);
+    assert.equal(body, "internal server error");
+    assert.doesNotMatch(body, /<pre>/);
+    assert.doesNotMatch(body, /at Server\.|at Object\./);
+    assert.doesNotMatch(body, /C:\\repos/);
+    assert.doesNotMatch(body, /boom/);
 });
