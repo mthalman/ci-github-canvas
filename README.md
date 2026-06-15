@@ -4,6 +4,7 @@ A [canvas extension](https://docs.github.com/en/copilot/how-tos/github-copilot-a
 
 1. **Copilot tab** — pull requests currently in scope as Copilot project sessions on this machine, read directly from `~/.copilot/data.db`.
 2. **All my PRs tab** — every open pull request you authored across GitHub, with their **Azure Pipelines** check status grouped by build, deep-linked into each AzDO job log.
+3. **Watched tab** — a manually curated list of any GitHub PRs (yours or not) you want to keep an eye on. Paste a PR URL to start tracking its CI; remove with the ✕ button. Watched PRs participate in the failure / completion notifier the same way authored PRs do.
 
 PRs that appear in both tabs get an `in session` badge in the "All my PRs" view so you can see at a glance which of your open PRs already have a Copilot session waiting on them.
 
