@@ -6,17 +6,35 @@
 
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { request as httpRequest } from "node:http";
 
-import { startServer } from "../lib/server.mjs";
+import { startServer, sendServerError } from "../lib/server.mjs";
 
 let server;
 let baseUrl;
+let port;
 
 before(async () => {
     const entry = await startServer();
     server = entry.server;
     baseUrl = entry.url.replace(/\/$/, "");
+    port = Number(new URL(entry.url).port);
 });
+
+// Low-level request helper so we can set headers (Host, Origin, Sec-Fetch-*)
+// that the fetch API treats as forbidden / unsettable.
+function rawRequest({ method = "GET", path = "/", headers = {}, body } = {}) {
+    return new Promise((resolve, reject) => {
+        const req = httpRequest({ host: "127.0.0.1", port, path, method, headers }, (res) => {
+            let data = "";
+            res.on("data", (c) => (data += c));
+            res.on("end", () => resolve({ status: res.statusCode, body: data }));
+        });
+        req.on("error", reject);
+        if (body != null) req.write(body);
+        req.end();
+    });
+}
 
 after(async () => {
     await new Promise((resolve) => server.close(() => resolve()));
@@ -130,4 +148,91 @@ test("DELETE /api/watched with unknown key returns 200 removed=false", async () 
 test("PUT /api/watched → 405", async () => {
     const r = await fetch(`${baseUrl}/api/watched`, { method: "PUT" });
     assert.equal(r.status, 405);
+});
+
+// --- security hardening ----------------------------------------------------
+
+test("rejects non-loopback Host header with 403 (DNS-rebinding guard)", async () => {
+    const r = await rawRequest({ path: "/api/notify-config", headers: { Host: "attacker.example" } });
+    assert.equal(r.status, 403);
+});
+
+test("allows loopback Host header", async () => {
+    const r = await rawRequest({ path: "/api/notify-config", headers: { Host: `127.0.0.1:${port}` } });
+    assert.equal(r.status, 200);
+});
+
+test("allows localhost Host header", async () => {
+    const r = await rawRequest({ path: "/api/notify-config", headers: { Host: `localhost:${port}` } });
+    assert.equal(r.status, 200);
+});
+
+test("rejects cross-site write via Sec-Fetch-Site with 403 (CSRF guard)", async () => {
+    const r = await rawRequest({
+        method: "POST",
+        path: "/api/notify-config",
+        headers: { Host: `127.0.0.1:${port}`, "Content-Type": "application/json", "Sec-Fetch-Site": "cross-site" },
+        body: "{}",
+    });
+    assert.equal(r.status, 403);
+});
+
+test("rejects cross-origin write via Origin header with 403 (CSRF guard)", async () => {
+    const r = await rawRequest({
+        method: "POST",
+        path: "/api/watched",
+        headers: { Host: `127.0.0.1:${port}`, "Content-Type": "application/json", Origin: "https://attacker.example" },
+        body: JSON.stringify({ url: "https://github.com/o/r/pull/1" }),
+    });
+    assert.equal(r.status, 403);
+});
+
+test("rejects cross-port Origin write with 403 (CSRF guard)", async () => {
+    // Same loopback hostname but a different port is still a different origin
+    // and must be blocked for state-changing requests.
+    const r = await rawRequest({
+        method: "POST",
+        path: "/api/watched",
+        headers: { Host: `127.0.0.1:${port}`, "Content-Type": "application/json", Origin: `http://127.0.0.1:${port + 1}` },
+        body: JSON.stringify({ url: "https://github.com/o/r/pull/1" }),
+    });
+    assert.equal(r.status, 403);
+});
+
+test("allows same-origin write (loopback Origin) past the CSRF guard", async () => {
+    // Bad body so it 400s inside the handler — the point is it is NOT 403'd.
+    const r = await rawRequest({
+        method: "POST",
+        path: "/api/watched",
+        headers: { Host: `127.0.0.1:${port}`, "Content-Type": "application/json", Origin: `http://127.0.0.1:${port}`, "Sec-Fetch-Site": "same-origin" },
+        body: JSON.stringify({ url: "not a url" }),
+    });
+    assert.equal(r.status, 400);
+});
+
+test("500 handler does not leak a stack trace", async () => {
+    // Drive the real error responder with an error that carries a stack and a
+    // local filesystem path, and assert neither is reflected to the caller.
+    const err = new Error("boom at C:\\repos\\secret\\path.mjs");
+    const chunks = [];
+    const headers = {};
+    const fakeRes = {
+        statusCode: 200,
+        setHeader(k, v) { headers[k.toLowerCase()] = v; },
+        end(body) { if (body != null) chunks.push(String(body)); },
+    };
+    const origConsoleError = console.error;
+    console.error = () => {}; // suppress the intentional local error log
+    try {
+        sendServerError(fakeRes, err);
+    } finally {
+        console.error = origConsoleError;
+    }
+    const body = chunks.join("");
+    assert.equal(fakeRes.statusCode, 500);
+    assert.equal(body, "internal server error");
+    assert.doesNotMatch(body, /<pre>/);
+    assert.doesNotMatch(body, /at Server\.|at Object\./);
+    assert.doesNotMatch(body, /C:\\repos/);
+    assert.doesNotMatch(body, /boom/);
 });
