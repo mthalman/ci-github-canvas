@@ -3,9 +3,10 @@
 //   - classifyRun (pure)
 //   - collectNotifyStates, diffNewCompletions, diffNewFailures (pure)
 //   - formatAlertMessage (pure)
-//   - initNotifyConfig + saveNotifyConfig (via a tmp NOTIFY_CONFIG_PATH —
-//     these can't be redirected without editing the module, so we just
-//     exercise sanitizeNotifyConfig for the same surface area).
+//   - initNotifyConfig + saveNotifyConfig delegate to the unified settings
+//     store (lib/settings.mjs); their disk round-trip is covered in
+//     test/settings.test.mjs, so here we just exercise sanitizeNotifyConfig
+//     for the same surface area.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

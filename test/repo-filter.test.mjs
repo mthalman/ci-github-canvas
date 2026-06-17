@@ -1,9 +1,10 @@
 // Tests for lib/repo-filter.mjs (all pure / in-memory — no disk or network).
 //
-// Disk persistence (initRepoFilterConfig / saveRepoFilterConfig) writes to a
-// fixed REPO_FILTER_CONFIG_PATH that can't be redirected without editing the
-// module, so — mirroring test/notify.test.mjs — we cover the same surface
-// area through sanitizeRepoFilterConfig and the matching helpers instead.
+// Disk persistence (initRepoFilterConfig / saveRepoFilterConfig) delegates to
+// the unified settings store (lib/settings.mjs); its on-disk round-trip and
+// migration are covered in test/settings.test.mjs, so — mirroring
+// test/notify.test.mjs — we cover the same surface area through
+// sanitizeRepoFilterConfig and the matching helpers instead.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

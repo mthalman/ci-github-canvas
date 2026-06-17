@@ -22,6 +22,7 @@ import { HOST_POLL_INTERVAL_MS } from "./lib/constants.mjs";
 import { fetchPrsWithChecks } from "./lib/github.mjs";
 import { initNotifyConfig, runNotifyPoll, setActiveSession } from "./lib/notify.mjs";
 import { initRepoFilterConfig } from "./lib/repo-filter.mjs";
+import { initSettings } from "./lib/settings.mjs";
 import { startServer } from "./lib/server.mjs";
 import { fetchCopilotSessions, filterSessionsByLivePrState } from "./lib/sessions.mjs";
 
@@ -88,6 +89,11 @@ const session = await joinSession({
 setActiveSession(session);
 
 await session.log("ci-runs extension ready (v0.3)");
+
+// Load the unified settings document (notify + repo-filter sections, with
+// one-time migration from the pre-consolidation standalone files) before any
+// domain module reads its section or any fetch runs.
+await initSettings();
 
 // Load the repo filter config (include/exclude globs) before any fetch so
 // the first session/PR query already respects it. Empty lists = no filtering.

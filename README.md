@@ -113,7 +113,8 @@ my-org/*
 The filter applies to the **Copilot** and **All my PRs** tabs (and to the
 failure/completion notifier), so a filtered-out repo produces no alerts. It does
 **not** apply to the **Watched** tab — that list is an explicit, per-PR allowlist
-you curate by URL. The config persists to `artifacts/repo-filter.json`.
+you curate by URL. The config persists to the `repoFilter` section of
+`artifacts/settings.json`.
 
 ## Limitations
 
