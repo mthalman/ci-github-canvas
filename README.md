@@ -87,6 +87,33 @@ The agent will open the `ci-runs` canvas in a side panel. From there:
 - Click `↻ Refresh` to re-read the local session DB and re-query GitHub.
 - Click the AzDO build link to open the run in `dev.azure.com`.
 - Expand `show jobs` on a build to see per-job status with deep links to each job log.
+- Open the `⚙` settings menu to toggle notifications and configure a **repository filter**.
+
+### Repository filter
+
+The settings menu (`⚙`) has a **Repository filter** section: a single list of
+glob patterns (one per line) matched against each PR's `owner/repo`.
+
+- A bare pattern is an **allowlist** entry — when any allowlist patterns are
+  present, only repos matching at least one are queried.
+- A pattern prefixed with `!` is an **exclusion** — repos matching it are
+  hidden. Exclusion always wins over inclusion.
+- An empty list means "all repos".
+
+Glob syntax: `*` matches any characters (including `/`), `?` matches a single
+character; matching is case-insensitive. Example:
+
+```
+my-org/*
+!my-org/legacy-*
+```
+
+…queries every repo in `my-org` except those whose name starts with `legacy-`.
+
+The filter applies to the **Copilot** and **All my PRs** tabs (and to the
+failure/completion notifier), so a filtered-out repo produces no alerts. It does
+**not** apply to the **Watched** tab — that list is an explicit, per-PR allowlist
+you curate by URL. The config persists to `artifacts/repo-filter.json`.
 
 ## Limitations
 
