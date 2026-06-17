@@ -9,19 +9,22 @@ import * as C from "../lib/constants.mjs";
 test("constants: paths are absolute strings", () => {
     assert.equal(typeof C.DB_PATH, "string");
     assert.ok(C.DB_PATH.length > 0);
-    assert.equal(typeof C.NOTIFY_CONFIG_PATH, "string");
-    assert.ok(C.NOTIFY_CONFIG_PATH.endsWith("ci-runs.json"));
+    assert.equal(typeof C.SETTINGS_PATH, "string");
+    assert.ok(C.SETTINGS_PATH.endsWith("settings.json"));
+    assert.ok(C.LEGACY_NOTIFY_CONFIG_PATH.endsWith("ci-runs.json"));
+    assert.ok(C.LEGACY_REPO_FILTER_CONFIG_PATH.endsWith("repo-filter.json"));
 });
 
-test("constants: notify config lives under the extension's artifacts/ dir", () => {
+test("constants: settings + legacy config files live under the artifacts/ dir", () => {
     assert.equal(typeof C.EXTENSION_ROOT, "string");
     assert.equal(typeof C.ARTIFACTS_DIR, "string");
     assert.ok(C.ARTIFACTS_DIR.startsWith(C.EXTENSION_ROOT),
         "ARTIFACTS_DIR should live under EXTENSION_ROOT");
     assert.ok(C.ARTIFACTS_DIR.endsWith("artifacts"),
         "ARTIFACTS_DIR should be named 'artifacts'");
-    assert.ok(C.NOTIFY_CONFIG_PATH.startsWith(C.ARTIFACTS_DIR),
-        "NOTIFY_CONFIG_PATH should live under ARTIFACTS_DIR");
+    for (const p of [C.SETTINGS_PATH, C.LEGACY_NOTIFY_CONFIG_PATH, C.LEGACY_REPO_FILTER_CONFIG_PATH]) {
+        assert.ok(p.startsWith(C.ARTIFACTS_DIR), `${p} should live under ARTIFACTS_DIR`);
+    }
 });
 
 test("constants: TTLs are positive numbers", () => {

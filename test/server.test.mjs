@@ -68,6 +68,19 @@ test("DELETE /api/notify-config → 405", async () => {
     assert.equal(r.status, 405);
 });
 
+test("GET /api/repo-filter returns the in-memory config", async () => {
+    const r = await fetch(`${baseUrl}/api/repo-filter`);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(typeof body.config, "object");
+    assert.ok(Array.isArray(body.config.patterns));
+});
+
+test("DELETE /api/repo-filter → 405", async () => {
+    const r = await fetch(`${baseUrl}/api/repo-filter`, { method: "DELETE" });
+    assert.equal(r.status, 405);
+});
+
 test("GET /api/azdo-timeline rejects missing params with 400", async () => {
     const r = await fetch(`${baseUrl}/api/azdo-timeline`);
     assert.equal(r.status, 400);
