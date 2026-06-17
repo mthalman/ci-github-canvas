@@ -119,6 +119,25 @@ test("initSettings: a present section is not overwritten by a legacy file", asyn
     }
 });
 
+test("writeSettingsSection: concurrent writes serialize and last write wins", async () => {
+    const { dir, path } = await setup();
+    try {
+        await initSettings();
+        // Fire overlapping writes to the same section without awaiting in
+        // between; the queue must apply them in call order so the final
+        // on-disk value is the last one issued.
+        const writes = [];
+        for (let i = 0; i < 10; i++) {
+            writes.push(writeSettingsSection("notify", { seq: i }));
+        }
+        await Promise.all(writes);
+        assert.deepEqual(getSettingsSection("notify"), { seq: 9 });
+        assert.deepEqual(await readJson(path), { notify: { seq: 9 } });
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
 test("initSettings: a non-object document is treated as empty", async () => {
     const { dir, path } = await setup();
     try {
