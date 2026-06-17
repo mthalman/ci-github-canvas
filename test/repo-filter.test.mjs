@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-    globToRegExp,
+    globMatches,
     matchesAnyGlob,
     splitPatterns,
     sanitizeRepoFilterConfig,
@@ -17,40 +17,52 @@ import {
     filterPrsByRepo,
     filterSessionsByRepo,
     MAX_REPO_FILTER_PATTERNS,
+    MAX_REPO_FILTER_PATTERN_LENGTH,
 } from "../lib/repo-filter.mjs";
 
-// --- globToRegExp ----------------------------------------------------------
+// --- globMatches -----------------------------------------------------------
 
-test("globToRegExp: '*' matches any run of characters including '/'", () => {
-    assert.ok(globToRegExp("*").test("owner/repo"));
-    assert.ok(globToRegExp("owner/*").test("owner/repo"));
-    assert.ok(globToRegExp("owner/*").test("owner/"));
-    assert.ok(globToRegExp("*/repo").test("any-owner/repo"));
-    assert.ok(globToRegExp("owner/r*").test("owner/runtime"));
-    assert.ok(!globToRegExp("owner/*").test("other/repo"));
+test("globMatches: '*' matches any run of characters including '/'", () => {
+    assert.ok(globMatches("owner/repo", "*"));
+    assert.ok(globMatches("owner/repo", "owner/*"));
+    assert.ok(globMatches("owner/", "owner/*"));
+    assert.ok(globMatches("any-owner/repo", "*/repo"));
+    assert.ok(globMatches("owner/runtime", "owner/r*"));
+    assert.ok(!globMatches("other/repo", "owner/*"));
 });
 
-test("globToRegExp: '?' matches exactly one character", () => {
-    assert.ok(globToRegExp("owner/rep?").test("owner/repo"));
-    assert.ok(!globToRegExp("owner/rep?").test("owner/rep"));
-    assert.ok(!globToRegExp("owner/rep?").test("owner/repos"));
+test("globMatches: '?' matches exactly one character", () => {
+    assert.ok(globMatches("owner/repo", "owner/rep?"));
+    assert.ok(!globMatches("owner/rep", "owner/rep?"));
+    assert.ok(!globMatches("owner/repos", "owner/rep?"));
 });
 
-test("globToRegExp: matching is case-insensitive", () => {
-    assert.ok(globToRegExp("Owner/Repo").test("owner/repo"));
-    assert.ok(globToRegExp("owner/*").test("OWNER/REPO"));
+test("globMatches: matching is case-insensitive", () => {
+    assert.ok(globMatches("owner/repo", "Owner/Repo"));
+    assert.ok(globMatches("OWNER/REPO", "owner/*"));
 });
 
-test("globToRegExp: regex metacharacters are matched literally", () => {
-    assert.ok(globToRegExp("owner/repo.js").test("owner/repo.js"));
-    assert.ok(!globToRegExp("owner/repo.js").test("owner/repoxjs"));
-    assert.ok(globToRegExp("owner/a+b").test("owner/a+b"));
-    assert.ok(globToRegExp("owner/(x)").test("owner/(x)"));
+test("globMatches: regex metacharacters are matched literally", () => {
+    assert.ok(globMatches("owner/repo.js", "owner/repo.js"));
+    assert.ok(!globMatches("owner/repoxjs", "owner/repo.js"));
+    assert.ok(globMatches("owner/a+b", "owner/a+b"));
+    assert.ok(globMatches("owner/(x)", "owner/(x)"));
 });
 
-test("globToRegExp: is anchored (no partial matches)", () => {
-    assert.ok(!globToRegExp("owner/repo").test("xowner/repoy"));
-    assert.ok(!globToRegExp("repo").test("owner/repo"));
+test("globMatches: is anchored (no partial matches)", () => {
+    assert.ok(!globMatches("xowner/repoy", "owner/repo"));
+    assert.ok(!globMatches("owner/repo", "repo"));
+});
+
+test("globMatches: adversarial '*'-heavy pattern resolves fast and correctly", () => {
+    // A naive `*`->`.*` regex translation backtracks exponentially on this
+    // input; the linear matcher must return promptly and correctly.
+    const pattern = "*a*a*a*a*a*a*a*a*a*a*b";
+    const text = "a".repeat(64);
+    const start = Date.now();
+    assert.ok(!globMatches(text, pattern));
+    assert.ok(globMatches(text + "b", pattern));
+    assert.ok(Date.now() - start < 1000, "matcher should not backtrack exponentially");
 });
 
 // --- matchesAnyGlob --------------------------------------------------------
@@ -132,6 +144,12 @@ test("sanitizeRepoFilterConfig: caps the list at MAX_REPO_FILTER_PATTERNS", () =
     assert.equal(out.patterns.length, MAX_REPO_FILTER_PATTERNS);
 });
 
+test("sanitizeRepoFilterConfig: drops patterns over MAX_REPO_FILTER_PATTERN_LENGTH", () => {
+    const tooLong = "a".repeat(MAX_REPO_FILTER_PATTERN_LENGTH + 1);
+    const out = sanitizeRepoFilterConfig({ patterns: ["ok/x", tooLong] });
+    assert.deepEqual(out.patterns, ["ok/x"]);
+});
+
 // --- repoMatchesFilter -----------------------------------------------------
 
 test("repoMatchesFilter: empty config includes everything", () => {
@@ -200,6 +218,17 @@ test("filterSessionsByRepo: keeps a row if either source or created repo passes"
 test("filterSessionsByRepo: exclude drops a row even if included elsewhere", () => {
     const rows = [{ workspace_id: "a", repo_full_name: "my-org/legacy-svc" }];
     const cfg = { patterns: ["my-org/*", "!*/legacy-*"] };
+    assert.deepEqual(filterSessionsByRepo(rows, cfg), []);
+});
+
+test("filterSessionsByRepo: exclusion wins even when the other repo is included", () => {
+    // Source repo is excluded but the created-PR repo would be included. Since
+    // renderCopilot leads with the source repo, the row must be dropped so the
+    // user never sees the excluded source repo.
+    const rows = [
+        { workspace_id: "a", repo_full_name: "blocked/source", created_pr_repo: "my-org/tool" },
+    ];
+    const cfg = { patterns: ["my-org/*", "!blocked/*"] };
     assert.deepEqual(filterSessionsByRepo(rows, cfg), []);
 });
 
