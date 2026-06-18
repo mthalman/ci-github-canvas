@@ -80,20 +80,27 @@ const session = await joinSession({
                     // (deduped) rather than replacing what's already shown.
                     entry.addCiRunUrl?.(ciRunUrl);
                 }
-                const rawRows = fetchCopilotSessions();
-                const rows = (rawRows && rawRows.__error)
-                    ? rawRows
-                    : await filterSessionsByLivePrState(rawRows);
-                const sessionCount = Array.isArray(rows) ? rows.length : 0;
                 // Inspect mode is determined by whether the panel holds any runs
                 // (set on this open or a previous one), not just the current
                 // call's input — so re-opening/focusing an inspect panel without
                 // a ciRunUrl keeps the "Inspecting" status instead of flipping
                 // back to the session count.
                 const runCount = entry.ciRunCount?.() ?? 0;
-                const status = runCount > 0
-                    ? `Inspecting ${runCount} Azure DevOps CI run${runCount === 1 ? "" : "s"}`
-                    : `${sessionCount} active session${sessionCount === 1 ? "" : "s"}`;
+                let status;
+                if (runCount > 0) {
+                    // Inspect mode: the PR tabs are hidden and the status is
+                    // derived purely from the run count, so skip the Copilot
+                    // session fetch + live-PR filtering (avoids needless GitHub
+                    // API work and speeds up opening the panel).
+                    status = `Inspecting ${runCount} Azure DevOps CI run${runCount === 1 ? "" : "s"}`;
+                } else {
+                    const rawRows = fetchCopilotSessions();
+                    const rows = (rawRows && rawRows.__error)
+                        ? rawRows
+                        : await filterSessionsByLivePrState(rawRows);
+                    const sessionCount = Array.isArray(rows) ? rows.length : 0;
+                    status = `${sessionCount} active session${sessionCount === 1 ? "" : "s"}`;
+                }
                 return { title: "CI Runs", url: entry.url, status };
             },
             onClose: async (ctx) => {
