@@ -5,6 +5,7 @@ A [canvas extension](https://docs.github.com/en/copilot/how-tos/github-copilot-a
 1. **Copilot tab** — pull requests currently in scope as Copilot project sessions on this machine, read directly from `~/.copilot/data.db`.
 2. **All my PRs tab** — every open pull request you authored across GitHub, with their **Azure Pipelines** check status grouped by build, deep-linked into each AzDO job log.
 3. **Watched tab** — a manually curated list of any GitHub PRs (yours or not) you want to keep an eye on. Paste a PR URL to start tracking its CI; remove with the ✕ button. Watched PRs participate in the failure / completion notifier the same way authored PRs do.
+4. **Inspect mode** — when the canvas is opened with one or more `ciRunUrl` input parameters pointing at **Azure DevOps** pipeline runs, the surface is dedicated to inspecting those runs (the PR tabs are hidden). Lets you inspect a branch's CI run *before* a PR exists. Re-opening the same panel with another run URL adds it to the list; each run has a ✕ button to remove it. Public pipelines are read anonymously; private pipelines authenticate through the Azure CLI.
 
 PRs that appear in both tabs get an `in session` badge in the "All my PRs" view so you can see at a glance which of your open PRs already have a Copilot session waiting on them.
 
@@ -12,6 +13,7 @@ PRs that appear in both tabs get an `in session` badge in the "All my PRs" view 
 
 - The [GitHub Copilot app](https://github.com/github/app)
 - [`gh` CLI](https://cli.github.com/) installed and authenticated (`gh auth status`).
+- *(Optional)* [Azure CLI](https://aka.ms/azure-cli) (`az`), signed in with `az login` — only needed to inspect **private** Azure DevOps pipeline runs via the **CI Run** input (see [Inspecting a CI run by URL](#inspecting-a-ci-run-by-url)). Public pipelines need no auth.
 
 ## Install
 
@@ -88,6 +90,30 @@ The agent will open the `ci-runs` canvas in a side panel. From there:
 - Click the AzDO build link to open the run in `dev.azure.com`.
 - Expand `show jobs` on a build to see per-job status with deep links to each job log.
 - Open the `⚙` settings menu to toggle notifications and configure a **repository filter**.
+
+### Inspecting a CI run by URL
+
+The canvas accepts an optional **`ciRunUrl`** input parameter — the URL of an
+Azure DevOps pipeline run. This is handy when you're iterating on a branch and
+kicking off ADO builds *before* opening a PR. Ask the agent something like:
+
+> open the CI runs canvas for https://dev.azure.com/{org}/{project}/_build/results?buildId=123
+
+When opened with that input, the canvas enters **inspect mode**: the PR tabs are
+hidden and the surface is dedicated to the run(s), showing each build's overall
+status and per-job timeline with deep links to each job log. Re-opening the same
+panel with another run URL adds it to the list (deduped); each run has a ✕ button
+to remove it, and removing the last one leaves an empty placeholder.
+
+- **Public pipelines** are read anonymously — no setup required.
+- **Private pipelines** authenticate through the [Azure CLI](https://aka.ms/azure-cli).
+  The canvas first tries anonymous access; if Azure DevOps refuses it, it runs
+  `az account get-access-token` to mint a token scoped to the Azure DevOps REST
+  API. If `az` isn't installed, or you're not signed in, the panel shows an
+  actionable message (install `az`, or run `az login`) rather than a raw error.
+
+Only Azure DevOps pipeline URLs (`dev.azure.com/...` or
+`{org}.visualstudio.com/...` with a `buildId`) are supported.
 
 ### Repository filter
 

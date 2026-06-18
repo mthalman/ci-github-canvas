@@ -37,7 +37,17 @@ const session = await joinSession({
             id: "ci-runs",
             displayName: "CI Runs",
             description:
-                "Side-panel dashboard with two tabs: (1) Copilot sessions currently open in the desktop app with their PR/issue origin; (2) all open pull requests the user authored across GitHub. Cross-links the two so the user can see which of their PRs already have a Copilot session.",
+                "Side-panel dashboard with three tabs: (1) Copilot sessions currently open in the desktop app with their PR/issue origin; (2) all open pull requests the user authored across GitHub, cross-linked to those sessions; (3) PRs the user manually watches by URL. Can also be opened in inspect mode with one or more Azure DevOps build-results URLs (ciRunUrl) to view a branch's CI run directly before a PR exists.",
+            inputSchema: {
+                type: "object",
+                properties: {
+                    ciRunUrl: {
+                        type: "string",
+                        description:
+                            "Optional URL of an Azure DevOps pipeline run to inspect directly, e.g. https://dev.azure.com/{org}/{project}/_build/results?buildId=123. Use this to view a branch's CI run before a PR exists. Re-opening the same canvas panel with another run URL adds it to the panel alongside the existing run(s). Public pipelines are read anonymously; private pipelines authenticate via the Azure CLI (the user must have `az` installed and be signed in with `az login`).",
+                    },
+                },
+            },
             actions: [
                 {
                     name: "refresh",
@@ -60,17 +70,38 @@ const session = await joinSession({
                 },
             ],
             open: async (ctx) => {
+                const ciRunUrl = typeof ctx.input?.ciRunUrl === "string" ? ctx.input.ciRunUrl.trim() : "";
                 let entry = servers.get(ctx.instanceId);
                 if (!entry) {
-                    entry = await startServer();
+                    entry = await startServer({ ciRunUrl });
                     servers.set(ctx.instanceId, entry);
+                } else {
+                    // Re-open of an existing panel: add this run to the panel
+                    // (deduped) rather than replacing what's already shown.
+                    entry.addCiRunUrl?.(ciRunUrl);
                 }
-                const rawRows = fetchCopilotSessions();
-                const rows = (rawRows && rawRows.__error)
-                    ? rawRows
-                    : await filterSessionsByLivePrState(rawRows);
-                const sessionCount = Array.isArray(rows) ? rows.length : 0;
-                return { title: "CI Runs", url: entry.url, status: `${sessionCount} active session${sessionCount === 1 ? "" : "s"}` };
+                // Inspect mode is determined by whether the panel holds any runs
+                // (set on this open or a previous one), not just the current
+                // call's input — so re-opening/focusing an inspect panel without
+                // a ciRunUrl keeps the "Inspecting" status instead of flipping
+                // back to the session count.
+                const runCount = entry.ciRunCount?.() ?? 0;
+                let status;
+                if (runCount > 0) {
+                    // Inspect mode: the PR tabs are hidden and the status is
+                    // derived purely from the run count, so skip the Copilot
+                    // session fetch + live-PR filtering (avoids needless GitHub
+                    // API work and speeds up opening the panel).
+                    status = `Inspecting ${runCount} Azure DevOps CI run${runCount === 1 ? "" : "s"}`;
+                } else {
+                    const rawRows = fetchCopilotSessions();
+                    const rows = (rawRows && rawRows.__error)
+                        ? rawRows
+                        : await filterSessionsByLivePrState(rawRows);
+                    const sessionCount = Array.isArray(rows) ? rows.length : 0;
+                    status = `${sessionCount} active session${sessionCount === 1 ? "" : "s"}`;
+                }
+                return { title: "CI Runs", url: entry.url, status };
             },
             onClose: async (ctx) => {
                 const entry = servers.get(ctx.instanceId);
