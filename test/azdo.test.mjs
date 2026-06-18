@@ -3,7 +3,7 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseAzdoUrl, summarizeAzdoRuns, fetchAzdoTimeline } from "../lib/azdo.mjs";
+import { parseAzdoUrl, parseAzdoBuildUrl, summarizeAzdoRuns, fetchAzdoTimeline, getAzdoAccessToken, fetchAzdoBuild } from "../lib/azdo.mjs";
 
 test("parseAzdoUrl: dev.azure.com extracts org and project", () => {
     const got = parseAzdoUrl("https://dev.azure.com/myorg/My%20Project/_build/results?buildId=1");
@@ -27,6 +27,73 @@ test("parseAzdoUrl: dev.azure.com missing project segment yields null project", 
     const got = parseAzdoUrl("https://dev.azure.com/justorg");
     assert.equal(got.org, "justorg");
     assert.equal(got.project, null);
+});
+
+// --- parseAzdoBuildUrl ------------------------------------------------------
+
+test("parseAzdoBuildUrl: dev.azure.com build-results URL extracts org/project/buildId", () => {
+    const got = parseAzdoBuildUrl("https://dev.azure.com/myorg/My%20Project/_build/results?buildId=123&view=logs");
+    assert.deepEqual(got, { org: "myorg", project: "My Project", buildId: "123" });
+});
+
+test("parseAzdoBuildUrl: legacy *.visualstudio.com works", () => {
+    const got = parseAzdoBuildUrl("https://myorg.visualstudio.com/Proj/_build/results?buildId=42");
+    assert.deepEqual(got, { org: "myorg", project: "Proj", buildId: "42" });
+});
+
+test("parseAzdoBuildUrl: missing buildId returns null", () => {
+    assert.equal(parseAzdoBuildUrl("https://dev.azure.com/org/Proj/_build/results"), null);
+});
+
+test("parseAzdoBuildUrl: non-AzDO host returns null", () => {
+    assert.equal(parseAzdoBuildUrl("https://github.com/o/r/actions/runs/1"), null);
+});
+
+test("parseAzdoBuildUrl: blank / non-string returns null", () => {
+    assert.equal(parseAzdoBuildUrl("   "), null);
+    assert.equal(parseAzdoBuildUrl(null), null);
+    assert.equal(parseAzdoBuildUrl(42), null);
+});
+
+// --- getAzdoAccessToken (Azure CLI, runAz stubbed) -------------------------
+
+test("getAzdoAccessToken: ENOENT spawn error → not_installed", async () => {
+    const runAz = async () => ({ code: null, stdout: "", stderr: "", spawnError: Object.assign(new Error("spawn az ENOENT"), { code: "ENOENT" }) });
+    const r = await getAzdoAccessToken({ runAz });
+    assert.equal(r.token, undefined);
+    assert.equal(r.errorKind, "not_installed");
+    assert.match(r.error, /Azure CLI .*not found|az login/i);
+});
+
+test("getAzdoAccessToken: non-zero exit → not_logged_in (and surfaces stderr)", async () => {
+    const runAz = async () => ({ code: 1, stdout: "", stderr: "Please run 'az login'", spawnError: null });
+    const r = await getAzdoAccessToken({ runAz });
+    assert.equal(r.errorKind, "not_logged_in");
+    assert.match(r.error, /az login/i);
+    assert.match(r.error, /Please run 'az login'/);
+});
+
+test("getAzdoAccessToken: success returns the token", async () => {
+    const runAz = async (args) => {
+        assert.ok(args.includes("get-access-token"));
+        assert.ok(args.includes("499b84ac-1321-427f-aa17-267ca6975798"));
+        return { code: 0, stdout: JSON.stringify({ accessToken: "tok-123", expiresOn: "2099-01-01" }), stderr: "", spawnError: null };
+    };
+    const r = await getAzdoAccessToken({ runAz });
+    assert.equal(r.token, "tok-123");
+    assert.equal(r.error, undefined);
+});
+
+test("getAzdoAccessToken: unparsable stdout → parse_failed", async () => {
+    const runAz = async () => ({ code: 0, stdout: "not json", stderr: "", spawnError: null });
+    const r = await getAzdoAccessToken({ runAz });
+    assert.equal(r.errorKind, "parse_failed");
+});
+
+test("getAzdoAccessToken: empty token → empty_token", async () => {
+    const runAz = async () => ({ code: 0, stdout: JSON.stringify({ accessToken: "" }), stderr: "", spawnError: null });
+    const r = await getAzdoAccessToken({ runAz });
+    assert.equal(r.errorKind, "empty_token");
 });
 
 test("summarizeAzdoRuns: no AzDO runs → hasAny false", () => {
@@ -260,4 +327,93 @@ test("fetchAzdoTimeline: HTTP error response surfaces error", async () => {
     const r = await fetchAzdoTimeline({ org: "org", project: "Bad", buildId: "9004" });
     assert.equal(r.data, null);
     assert.match(r.error, /HTTP 500/);
+});
+
+// --- fetchAzdoBuild (anonymous + Azure CLI fallback) ----------------------
+
+const buildOk = {
+    status: "completed",
+    result: "succeeded",
+    buildNumber: "20240101.1",
+    _links: { web: { href: "https://dev.azure.com/org/Project/_build/results?buildId=1" } },
+};
+const timelineOk = { records: [{ id: "j1", type: "Job", name: "Job A", state: "completed", result: "succeeded" }] };
+
+function signinResp() {
+    return new Response("<html>signin</html>", { status: 203, headers: { "content-type": "text/html" } });
+}
+
+test("fetchAzdoBuild: anonymous success does not touch the Azure CLI", async () => {
+    let azCalls = 0;
+    const runAz = async () => { azCalls++; return { code: 0, stdout: "{}", stderr: "", spawnError: null }; };
+    fetchPlan = [
+        (url) => url.includes("/timeline") ? jsonResp(timelineOk) : jsonResp(buildOk),
+        (url) => url.includes("/timeline") ? jsonResp(timelineOk) : jsonResp(buildOk),
+    ];
+    const r = await fetchAzdoBuild({ org: "org", project: "PubProj", buildId: "8001", runAz });
+    assert.equal(r.error, null);
+    assert.equal(r.auth, "anonymous");
+    assert.equal(r.data.build.buildNumber, "20240101.1");
+    assert.equal(r.data.records.length, 1);
+    assert.equal(azCalls, 0);
+});
+
+test("fetchAzdoBuild: anonymous non-auth error surfaces without trying the Azure CLI", async () => {
+    let azCalls = 0;
+    const runAz = async () => { azCalls++; return { code: 0, stdout: "{}", stderr: "", spawnError: null }; };
+    fetchPlan = [
+        async () => new Response("{}", { status: 500, statusText: "Server Error", headers: { "content-type": "application/json" } }),
+        async () => new Response("{}", { status: 500, statusText: "Server Error", headers: { "content-type": "application/json" } }),
+    ];
+    const r = await fetchAzdoBuild({ org: "org", project: "ErrProj", buildId: "8002", runAz });
+    assert.equal(r.data, null);
+    assert.equal(r.errorKind, "fetch_failed");
+    assert.equal(azCalls, 0);
+});
+
+test("fetchAzdoBuild: auth-required falls back to Azure CLI token and succeeds", async () => {
+    let azCalls = 0;
+    const runAz = async () => { azCalls++; return { code: 0, stdout: JSON.stringify({ accessToken: "tok" }), stderr: "", spawnError: null }; };
+    fetchPlan = [
+        signinResp,
+        signinResp,
+        (url) => url.includes("/timeline") ? jsonResp(timelineOk) : jsonResp(buildOk),
+        (url) => url.includes("/timeline") ? jsonResp(timelineOk) : jsonResp(buildOk),
+    ];
+    const r = await fetchAzdoBuild({ org: "org", project: "PrivProj", buildId: "8003", runAz });
+    assert.equal(r.error, null);
+    assert.equal(r.auth, "azure-cli");
+    assert.equal(r.data.build.buildNumber, "20240101.1");
+    assert.equal(azCalls, 1);
+    // The authenticated fetch carried a Bearer token.
+    assert.equal(fetchCalls.length, 4);
+});
+
+test("fetchAzdoBuild: auth-required + az not installed → not_installed error", async () => {
+    const runAz = async () => ({ code: null, stdout: "", stderr: "", spawnError: Object.assign(new Error("spawn az ENOENT"), { code: "ENOENT" }) });
+    fetchPlan = [signinResp, signinResp];
+    const r = await fetchAzdoBuild({ org: "org", project: "PrivProj2", buildId: "8004", runAz });
+    assert.equal(r.data, null);
+    assert.equal(r.errorKind, "not_installed");
+    assert.equal(r.auth, "azure-cli");
+    assert.match(r.error, /Azure CLI/i);
+});
+
+test("fetchAzdoBuild: passes Bearer token on the authenticated retry", async () => {
+    const runAz = async () => ({ code: 0, stdout: JSON.stringify({ accessToken: "secret-tok" }), stderr: "", spawnError: null });
+    const seenAuth = [];
+    // Override the stub fetch to capture headers for this test.
+    globalThis.fetch = async (url, opts) => {
+        fetchCalls.push(url);
+        seenAuth.push(opts?.headers?.Authorization ?? null);
+        // First two (anonymous) → sign-in; next two (authed) → json.
+        if (seenAuth.length <= 2) return signinResp();
+        return url.includes("/timeline") ? jsonResp(timelineOk) : jsonResp(buildOk);
+    };
+    const r = await fetchAzdoBuild({ org: "org", project: "PrivProj3", buildId: "8005", runAz });
+    assert.equal(r.auth, "azure-cli");
+    assert.equal(seenAuth[0], null);
+    assert.equal(seenAuth[1], null);
+    assert.equal(seenAuth[2], "Bearer secret-tok");
+    assert.equal(seenAuth[3], "Bearer secret-tok");
 });

@@ -47,6 +47,22 @@ test("GET / returns HTML page", async () => {
     const body = await r.text();
     assert.match(body, /<!doctype html>/i);
     assert.match(body, /CI Runs/);
+    // No run configured on the shared server: the body must not be stamped
+    // inspect-mode, so the PR tabs render normally.
+    assert.doesNotMatch(body, /<body class="inspect-mode">/);
+});
+
+test("GET / stamps <body class=\"inspect-mode\"> when a run is configured", async () => {
+    // The server pre-marks the page in inspect mode so the PR tab bar/panels are
+    // hidden from first paint — no flash before the client's /api/ci-run fetch.
+    const entry = await startServer({ ciRunUrl: "https://dev.azure.com/org/proj/_build/results?buildId=1" });
+    try {
+        const url = entry.url.replace(/\/$/, "");
+        const body = await fetch(`${url}/`).then((r) => r.text());
+        assert.match(body, /<body class="inspect-mode">/);
+    } finally {
+        await new Promise((resolve) => entry.server.close(() => resolve()));
+    }
 });
 
 test("GET unknown path returns 404", async () => {
@@ -163,7 +179,124 @@ test("PUT /api/watched → 405", async () => {
     assert.equal(r.status, 405);
 });
 
+// --- /api/ci-run -----------------------------------------------------------
+
+test("GET /api/ci-run returns configured:false when no ciRunUrl was supplied", async () => {
+    const r = await fetch(`${baseUrl}/api/ci-run`);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.configured, false);
+});
+
+test("GET /api/ci-run with a configured but malformed URL returns a bad_url error", async () => {
+    const entry = await startServer({ ciRunUrl: "not a pipeline url" });
+    try {
+        const url = entry.url.replace(/\/$/, "");
+        const r = await fetch(`${url}/api/ci-run`);
+        assert.equal(r.status, 200);
+        const body = await r.json();
+        assert.equal(body.configured, true);
+        assert.equal(body.runs.length, 1);
+        assert.equal(body.runs[0].errorKind, "bad_url");
+        assert.match(body.runs[0].error ?? "", /Azure DevOps pipeline run URL/i);
+    } finally {
+        await new Promise((resolve) => entry.server.close(() => resolve()));
+    }
+});
+
+test("setCiRunUrl swaps the configured run for the same panel", async () => {
+    const entry = await startServer();
+    try {
+        const url = entry.url.replace(/\/$/, "");
+        let body = await fetch(`${url}/api/ci-run`).then((r) => r.json());
+        assert.equal(body.configured, false);
+        // Swap in a (malformed) URL: proves the setter mutates server state
+        // without reaching the network (a valid URL would hit dev.azure.com).
+        entry.setCiRunUrl("https://example.com/not/azdo");
+        body = await fetch(`${url}/api/ci-run`).then((r) => r.json());
+        assert.equal(body.configured, true);
+        assert.equal(body.runs.length, 1);
+        assert.equal(body.runs[0].errorKind, "bad_url");
+        // Swapping back to empty hides the run again.
+        entry.setCiRunUrl("");
+        body = await fetch(`${url}/api/ci-run`).then((r) => r.json());
+        assert.equal(body.configured, false);
+    } finally {
+        await new Promise((resolve) => entry.server.close(() => resolve()));
+    }
+});
+
+test("addCiRunUrl appends runs to the same panel and dedupes", async () => {
+    // Use malformed URLs so the panel resolves them offline (bad_url) without
+    // reaching dev.azure.com; we're only verifying the run-list bookkeeping.
+    const entry = await startServer({ ciRunUrl: "https://example.com/run/a" });
+    try {
+        const url = entry.url.replace(/\/$/, "");
+        let body = await fetch(`${url}/api/ci-run`).then((r) => r.json());
+        assert.equal(body.configured, true);
+        assert.equal(body.runs.length, 1);
+        assert.equal(body.runs[0].url, "https://example.com/run/a");
+        // Add a second, distinct run: the panel now holds both, in order.
+        entry.addCiRunUrl("https://example.com/run/b");
+        body = await fetch(`${url}/api/ci-run`).then((r) => r.json());
+        assert.equal(body.runs.length, 2);
+        assert.deepEqual(body.runs.map((x) => x.url), [
+            "https://example.com/run/a",
+            "https://example.com/run/b",
+        ]);
+        // Adding a duplicate (or blank) is a no-op.
+        entry.addCiRunUrl("https://example.com/run/b");
+        entry.addCiRunUrl("   ");
+        body = await fetch(`${url}/api/ci-run`).then((r) => r.json());
+        assert.equal(body.runs.length, 2);
+    } finally {
+        await new Promise((resolve) => entry.server.close(() => resolve()));
+    }
+});
+
 // --- security hardening ----------------------------------------------------
+
+test("DELETE /api/ci-run removes one run and returns the updated list", async () => {
+    // Malformed URLs resolve offline (bad_url) so this stays network-free.
+    const entry = await startServer({ ciRunUrl: "https://example.com/run/a" });
+    try {
+        const url = entry.url.replace(/\/$/, "");
+        entry.addCiRunUrl("https://example.com/run/b");
+        let body = await fetch(`${url}/api/ci-run`).then((r) => r.json());
+        assert.equal(body.runs.length, 2);
+        // Remove the first run via the HTTP DELETE the panel's ✕ button uses.
+        const del = await fetch(`${url}/api/ci-run?url=${encodeURIComponent("https://example.com/run/a")}`, { method: "DELETE" });
+        assert.equal(del.status, 200);
+        body = await del.json();
+        assert.equal(body.configured, true);
+        assert.deepEqual(body.runs.map((x) => x.url), ["https://example.com/run/b"]);
+        // Removing the last run flips the panel back to configured:false.
+        const del2 = await fetch(`${url}/api/ci-run?url=${encodeURIComponent("https://example.com/run/b")}`, { method: "DELETE" });
+        body = await del2.json();
+        assert.equal(body.configured, false);
+        assert.equal(body.runs.length, 0);
+        // Deleting an unknown URL is a harmless no-op.
+        const del3 = await fetch(`${url}/api/ci-run?url=${encodeURIComponent("https://example.com/nope")}`, { method: "DELETE" });
+        assert.equal(del3.status, 200);
+    } finally {
+        await new Promise((resolve) => entry.server.close(() => resolve()));
+    }
+});
+
+test("removeCiRunUrl drops a run from the panel state", async () => {
+    const entry = await startServer({ ciRunUrl: "https://example.com/run/a" });
+    try {
+        const url = entry.url.replace(/\/$/, "");
+        entry.addCiRunUrl("https://example.com/run/b");
+        assert.equal(entry.removeCiRunUrl("https://example.com/run/a"), true);
+        const body = await fetch(`${url}/api/ci-run`).then((r) => r.json());
+        assert.deepEqual(body.runs.map((x) => x.url), ["https://example.com/run/b"]);
+        // Removing a URL that isn't present returns false.
+        assert.equal(entry.removeCiRunUrl("https://example.com/missing"), false);
+    } finally {
+        await new Promise((resolve) => entry.server.close(() => resolve()));
+    }
+});
 
 test("rejects non-loopback Host header with 403 (DNS-rebinding guard)", async () => {
     const r = await rawRequest({ path: "/api/notify-config", headers: { Host: "attacker.example" } });
