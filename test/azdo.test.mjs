@@ -45,6 +45,18 @@ test("parseAzdoBuildUrl: missing buildId returns null", () => {
     assert.equal(parseAzdoBuildUrl("https://dev.azure.com/org/Proj/_build/results"), null);
 });
 
+test("parseAzdoBuildUrl: non-numeric buildId suffix returns null", () => {
+    // The shared extraction regex would partial-match "123" from "123abc";
+    // the validator must reject it rather than silently inspect build 123.
+    assert.equal(parseAzdoBuildUrl("https://dev.azure.com/org/Proj/_build/results?buildId=123abc"), null);
+    assert.equal(parseAzdoBuildUrl("https://dev.azure.com/org/Proj/_build/results?buildId=12.3"), null);
+});
+
+test("parseAzdoBuildUrl: numeric buildId followed by another param is accepted", () => {
+    const got = parseAzdoBuildUrl("https://dev.azure.com/org/Proj/_build/results?buildId=123&view=logs");
+    assert.deepEqual(got, { org: "org", project: "Proj", buildId: "123" });
+});
+
 test("parseAzdoBuildUrl: non-AzDO host returns null", () => {
     assert.equal(parseAzdoBuildUrl("https://github.com/o/r/actions/runs/1"), null);
 });
