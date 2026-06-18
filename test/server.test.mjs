@@ -48,8 +48,10 @@ test("GET / returns HTML page", async () => {
     assert.match(body, /<!doctype html>/i);
     assert.match(body, /CI Runs/);
     // No run configured on the shared server: the body must not be stamped
-    // inspect-mode, so the PR tabs render normally.
-    assert.doesNotMatch(body, /<body class="inspect-mode">/);
+    // inspect-mode, so the PR tabs render normally. Match the class token
+    // anywhere in the <body> tag so the assertion holds if other body classes
+    // are ever added.
+    assert.doesNotMatch(body, /<body[^>]*\binspect-mode\b[^>]*>/);
 });
 
 test("GET / stamps <body class=\"inspect-mode\"> when a run is configured", async () => {
@@ -59,7 +61,9 @@ test("GET / stamps <body class=\"inspect-mode\"> when a run is configured", asyn
     try {
         const url = entry.url.replace(/\/$/, "");
         const body = await fetch(`${url}/`).then((r) => r.text());
-        assert.match(body, /<body class="inspect-mode">/);
+        // Match the inspect-mode class token anywhere in the <body> tag so the
+        // assertion holds if other body classes are ever added.
+        assert.match(body, /<body[^>]*\binspect-mode\b[^>]*>/);
     } finally {
         await new Promise((resolve) => entry.server.close(() => resolve()));
     }
