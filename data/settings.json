@@ -1,0 +1,9 @@
+{
+  "notify": {
+    "notifyOnRunCompletion": false,
+    "notifyOnJobFailure": true
+  },
+  "repoFilter": {
+    "patterns": []
+  }
+}
