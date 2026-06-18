@@ -73,6 +73,17 @@ test("getAzdoAccessToken: non-zero exit → not_logged_in (and surfaces stderr)"
     assert.match(r.error, /Please run 'az login'/);
 });
 
+test("getAzdoAccessToken: non-zero exit with 'is not recognized' stderr → not_installed (Windows shell:true)", async () => {
+    // On Windows `az` runs via cmd.exe, so a missing CLI exits non-zero with a
+    // "is not recognized" message rather than an ENOENT spawn error.
+    const runAz = async () => ({ code: 1, stdout: "", stderr: "'az' is not recognized as an internal or external command,\noperable program or batch file.", spawnError: null });
+    const r = await getAzdoAccessToken({ runAz });
+    assert.equal(r.token, undefined);
+    assert.equal(r.errorKind, "not_installed");
+    assert.match(r.error, /not found|aka\.ms\/azure-cli/i);
+});
+
+
 test("getAzdoAccessToken: success returns the token", async () => {
     const runAz = async (args) => {
         assert.ok(args.includes("get-access-token"));
