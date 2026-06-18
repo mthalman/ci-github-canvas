@@ -3,7 +3,7 @@
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
-import { parseAzdoUrl, parseAzdoBuildUrl, summarizeAzdoRuns, fetchAzdoTimeline, getAzdoAccessToken, fetchAzdoBuild } from "../lib/azdo.mjs";
+import { parseAzdoUrl, parseAzdoBuildUrl, summarizeAzdoRuns, fetchAzdoTimeline, getAzdoAccessToken, fetchAzdoBuild, createSharedTokenGetter } from "../lib/azdo.mjs";
 
 test("parseAzdoUrl: dev.azure.com extracts org and project", () => {
     const got = parseAzdoUrl("https://dev.azure.com/myorg/My%20Project/_build/results?buildId=1");
@@ -398,6 +398,17 @@ test("fetchAzdoBuild: auth-required falls back to Azure CLI token and succeeds",
     assert.equal(azCalls, 1);
     // The authenticated fetch carried a Bearer token.
     assert.equal(fetchCalls.length, 4);
+});
+
+test("createSharedTokenGetter spawns az at most once across concurrent callers", async () => {
+    let azCalls = 0;
+    const runAz = async () => { azCalls++; return { code: 0, stdout: JSON.stringify({ accessToken: "shared-tok" }), stderr: "", spawnError: null }; };
+    const getToken = createSharedTokenGetter({ runAz });
+    const [a, b, c] = await Promise.all([getToken(), getToken(), getToken()]);
+    assert.equal(azCalls, 1);
+    assert.equal(a.token, "shared-tok");
+    assert.equal(b.token, "shared-tok");
+    assert.equal(c.token, "shared-tok");
 });
 
 test("fetchAzdoBuild: auth-required + az not installed → not_installed error", async () => {
