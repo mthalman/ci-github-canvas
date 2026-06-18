@@ -163,10 +163,39 @@ test("repoMatchesFilter: bare patterns act as an allowlist", () => {
     assert.ok(!repoMatchesFilter("other/api", cfg));
 });
 
-test("repoMatchesFilter: '!' patterns exclude; exclude wins over include", () => {
+test("repoMatchesFilter: '!' patterns exclude; a later exclude hides an earlier include", () => {
     const cfg = { patterns: ["my-org/*", "!my-org/legacy-*"] };
     assert.ok(repoMatchesFilter("my-org/api", cfg));
     assert.ok(!repoMatchesFilter("my-org/legacy-svc", cfg));
+});
+
+test("repoMatchesFilter: carves a single repo out of a broad exclusion (no trailing wildcard)", () => {
+    // The headline last-match-wins feature: hide all of an owner's repos
+    // except one specific repo that a later, more-specific line re-includes.
+    const cfg = { patterns: ["!my-org/*", "my-org/keep-me"] };
+    assert.ok(repoMatchesFilter("my-org/keep-me", cfg)); // carved back in
+    assert.ok(!repoMatchesFilter("my-org/other", cfg)); // still hidden
+});
+
+test("repoMatchesFilter: reported scenario — specific repo shows even though its owner was excluded", () => {
+    // The user's literal config. Note the trailing '*' re-includes everything,
+    // so this proves the specific repo shows but does NOT hide the owner's
+    // other repos (see the carve-out test above for that).
+    const cfg = { patterns: ["!mthalman/*", "mthalman/ci-github-canvas", "*"] };
+    assert.ok(repoMatchesFilter("mthalman/ci-github-canvas", cfg));
+    assert.ok(repoMatchesFilter("mthalman/other", cfg)); // trailing '*' re-includes it
+});
+
+test("repoMatchesFilter: ordering matters — later line overrides earlier one", () => {
+    // include then exclude -> excluded
+    assert.ok(!repoMatchesFilter("my-org/svc", { patterns: ["my-org/*", "!my-org/*"] }));
+    // exclude then include -> included (re-inclusion)
+    assert.ok(repoMatchesFilter("my-org/svc", { patterns: ["!my-org/*", "my-org/*"] }));
+});
+
+test("repoMatchesFilter: a trailing '*' re-includes a repo an earlier line excluded", () => {
+    const cfg = { patterns: ["!my-org/legacy-*", "*"] };
+    assert.ok(repoMatchesFilter("my-org/legacy-svc", cfg));
 });
 
 test("repoMatchesFilter: exclude-only config still includes unmatched repos", () => {
@@ -201,6 +230,21 @@ test("filterPrsByRepo: passes through non-arrays unchanged", () => {
     assert.equal(filterPrsByRepo(undefined, { patterns: ["x"] }), undefined);
 });
 
+test("filterPrsByRepo: carves a single repo out of a broad exclusion", () => {
+    // No trailing wildcard, so the exclusion genuinely hides the owner's other
+    // repos while the later, more-specific line re-includes just one.
+    const prs = [
+        { number: 1, repository: { nameWithOwner: "my-org/keep-me" } },
+        { number: 2, repository: { nameWithOwner: "my-org/other" } },
+        { number: 3, repository: { nameWithOwner: "someone/else" } },
+    ];
+    const cfg = { patterns: ["!my-org/*", "my-org/keep-me"] };
+    const out = filterPrsByRepo(prs, cfg);
+    // keep-me carved back in; my-org/other hidden; someone/else outside the
+    // allowlist (a bare pattern exists) so also dropped.
+    assert.deepEqual(out.map((p) => p.number), [1]);
+});
+
 // --- filterSessionsByRepo --------------------------------------------------
 
 test("filterSessionsByRepo: keeps a row if either source or created repo passes", () => {
@@ -231,6 +275,20 @@ test("filterSessionsByRepo: exclusion wins even when the other repo is included"
     ];
     const cfg = { patterns: ["my-org/*", "!blocked/*"] };
     assert.deepEqual(filterSessionsByRepo(rows, cfg), []);
+});
+
+test("filterSessionsByRepo: carves a single source repo out of a broad exclusion", () => {
+    const rows = [
+        { workspace_id: "a", repo_full_name: "my-org/keep-me" },
+        { workspace_id: "b", repo_full_name: "my-org/other" },
+    ];
+    // No trailing wildcard: the exclusion genuinely hides the owner's other
+    // repos while a later, more-specific line re-includes just one.
+    const cfg = { patterns: ["!my-org/*", "my-org/keep-me"] };
+    assert.deepEqual(
+        filterSessionsByRepo(rows, cfg).map((r) => r.workspace_id),
+        ["a"],
+    );
 });
 
 test("filterSessionsByRepo: passes through non-arrays unchanged", () => {
