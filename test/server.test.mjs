@@ -254,6 +254,23 @@ test("addCiRunUrl appends runs to the same panel and dedupes", async () => {
     }
 });
 
+test("ciRunCount reflects the panel's configured run count", async () => {
+    const entry = await startServer({ ciRunUrl: "https://example.com/run/a" });
+    try {
+        assert.equal(entry.ciRunCount(), 1);
+        entry.addCiRunUrl("https://example.com/run/b");
+        assert.equal(entry.ciRunCount(), 2);
+        entry.removeCiRunUrl("https://example.com/run/a");
+        assert.equal(entry.ciRunCount(), 1);
+        // A panel opened without a run starts empty.
+        const empty = await startServer();
+        assert.equal(empty.ciRunCount(), 0);
+        await new Promise((resolve) => empty.server.close(() => resolve()));
+    } finally {
+        await new Promise((resolve) => entry.server.close(() => resolve()));
+    }
+});
+
 // --- security hardening ----------------------------------------------------
 
 test("DELETE /api/ci-run removes one run and returns the updated list", async () => {

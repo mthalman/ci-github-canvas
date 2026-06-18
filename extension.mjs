@@ -85,7 +85,13 @@ const session = await joinSession({
                     ? rawRows
                     : await filterSessionsByLivePrState(rawRows);
                 const sessionCount = Array.isArray(rows) ? rows.length : 0;
-                const status = ciRunUrl
+                // Inspect mode is determined by whether the panel holds any runs
+                // (set on this open or a previous one), not just the current
+                // call's input — so re-opening/focusing an inspect panel without
+                // a ciRunUrl keeps the "Inspecting" status instead of flipping
+                // back to the session count.
+                const inInspectMode = (entry.ciRunCount?.() ?? 0) > 0;
+                const status = inInspectMode
                     ? "Inspecting Azure DevOps CI run"
                     : `${sessionCount} active session${sessionCount === 1 ? "" : "s"}`;
                 return { title: "CI Runs", url: entry.url, status };
