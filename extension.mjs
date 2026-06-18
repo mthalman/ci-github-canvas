@@ -90,9 +90,9 @@ const session = await joinSession({
                 // call's input — so re-opening/focusing an inspect panel without
                 // a ciRunUrl keeps the "Inspecting" status instead of flipping
                 // back to the session count.
-                const inInspectMode = (entry.ciRunCount?.() ?? 0) > 0;
-                const status = inInspectMode
-                    ? "Inspecting Azure DevOps CI run"
+                const runCount = entry.ciRunCount?.() ?? 0;
+                const status = runCount > 0
+                    ? `Inspecting ${runCount} Azure DevOps CI run${runCount === 1 ? "" : "s"}`
                     : `${sessionCount} active session${sessionCount === 1 ? "" : "s"}`;
                 return { title: "CI Runs", url: entry.url, status };
             },
