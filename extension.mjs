@@ -37,7 +37,7 @@ const session = await joinSession({
             id: "ci-runs",
             displayName: "CI Runs",
             description:
-                "Side-panel dashboard with two tabs: (1) Copilot sessions currently open in the desktop app with their PR/issue origin; (2) all open pull requests the user authored across GitHub. Cross-links the two so the user can see which of their PRs already have a Copilot session.",
+                "Side-panel dashboard with three tabs: (1) Copilot sessions currently open in the desktop app with their PR/issue origin; (2) all open pull requests the user authored across GitHub, cross-linked to those sessions; (3) PRs the user manually watches by URL. Can also be opened in inspect mode with one or more Azure DevOps build-results URLs (ciRunUrl) to view a branch's CI run directly before a PR exists.",
             inputSchema: {
                 type: "object",
                 properties: {
