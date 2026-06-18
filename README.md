@@ -123,7 +123,10 @@ glob patterns (one per line) matched against each PR's `owner/repo`.
 - A bare pattern is an **allowlist** entry — when any allowlist patterns are
   present, only repos matching at least one are queried.
 - A pattern prefixed with `!` is an **exclusion** — repos matching it are
-  hidden. Exclusion always wins over inclusion.
+  hidden.
+- Patterns are evaluated top-to-bottom and the **last** matching line wins
+  (just like `.gitignore`), so a later, more-specific line can override an
+  earlier broad one.
 - An empty list means "all repos".
 
 Glob syntax: `*` matches any characters (including `/`), `?` matches a single
@@ -135,6 +138,16 @@ my-org/*
 ```
 
 …queries every repo in `my-org` except those whose name starts with `legacy-`.
+Because matching is last-match-wins, you can also carve a single repo back out
+of a broad exclusion:
+
+```
+!my-org/*
+my-org/keep-me
+```
+
+…hides every `my-org` repo except `my-org/keep-me`. (Order matters: put the
+narrow re-inclusion *after* the broad exclusion.)
 
 The filter applies to the **Copilot** and **All my PRs** tabs (and to the
 failure/completion notifier), so a filtered-out repo produces no alerts. It does
