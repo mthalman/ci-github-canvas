@@ -57,6 +57,12 @@ test("parseAzdoBuildUrl: numeric buildId followed by another param is accepted",
     assert.deepEqual(got, { org: "org", project: "Proj", buildId: "123" });
 });
 
+test("parseAzdoBuildUrl: non build-results path with buildId returns null", () => {
+    // A buildId query param on an unrelated AzDO path must not be accepted.
+    assert.equal(parseAzdoBuildUrl("https://dev.azure.com/org/Proj/_release?buildId=123"), null);
+    assert.equal(parseAzdoBuildUrl("https://dev.azure.com/org/Proj/_build?buildId=123"), null);
+});
+
 test("parseAzdoBuildUrl: non-AzDO host returns null", () => {
     assert.equal(parseAzdoBuildUrl("https://github.com/o/r/actions/runs/1"), null);
 });
