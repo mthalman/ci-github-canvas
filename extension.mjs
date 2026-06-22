@@ -20,7 +20,7 @@ import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
 
 import { HOST_POLL_INTERVAL_MS } from "./lib/constants.mjs";
 import { fetchPrsWithChecks } from "./lib/github.mjs";
-import { initNotifyConfig, runNotifyPoll, setActiveSession } from "./lib/notify.mjs";
+import { initNotifyConfig, runNotifyPoll, setActiveSession, setCanvasOpenProvider, countDashboardPanels } from "./lib/notify.mjs";
 import { initRepoFilterConfig } from "./lib/repo-filter.mjs";
 import { initDisplayConfig } from "./lib/display.mjs";
 import { initSettings } from "./lib/settings.mjs";
@@ -120,6 +120,15 @@ const session = await joinSession({
 // initNotifyConfig / runNotifyPoll so the first poll has the handle.
 setActiveSession(session);
 
+// Tell the notifier whether this session is actively watching PRs on the
+// canvas. The Copilot app runs one process per session, so this notifier owns
+// only this session's handle. `servers` holds one entry per open canvas panel
+// (added in `open`, removed in `onClose`); we count only panels in PR-dashboard
+// mode (not inspect mode), because inspect-mode panels hide the PR tabs and so
+// shouldn't trigger PR failure/completion alerts unrelated to the runs they're
+// inspecting.
+setCanvasOpenProvider(() => countDashboardPanels(servers));
+
 await session.log("ci-runs extension ready (v0.3)");
 
 // Load the unified settings document (notify + repo-filter sections, with
@@ -134,10 +143,12 @@ await initRepoFilterConfig();
 // Load display preferences (e.g. whether the Copilot tab shows others' PRs).
 await initDisplayConfig();
 
-// Host-side failure-notifier loop. Runs regardless of whether the canvas
-// panel is open, so the user gets alerts even with the side panel closed.
-// The first call seeds state silently; subsequent calls fire session.send()
-// when a build (or job) transitions from non-failure to failure.
+// Host-side failure-notifier loop. Polls on a fixed timer regardless of canvas
+// state so its diff baseline stays current, but only fires session.send() when
+// this session has the canvas open (see setCanvasOpenProvider above) — that
+// keeps alerts scoped to the session(s) actively watching the panel instead of
+// every session that loaded the extension. The first call seeds state silently;
+// subsequent calls fire when a build (or job) transitions to a reportable state.
 await initNotifyConfig();
 runNotifyPoll().catch((err) => console.error("ci-runs: initial notify poll failed", err));
 setInterval(() => {

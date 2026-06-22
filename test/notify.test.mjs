@@ -20,7 +20,110 @@ import {
     formatAlertMessage,
     sanitizePromptText,
     sanitizePromptUrl,
+    setCanvasOpenProvider,
+    isCanvasOpen,
+    countDashboardPanels,
 } from "../lib/notify.mjs";
+
+// --- canvas-open gate ------------------------------------------------------
+//
+// The notifier only fires session.send() when this session has the canvas
+// open. isCanvasOpen() reflects whatever provider extension.mjs wires up
+// (servers.size in practice). These tests pin the coercion + fail-safe rules.
+
+test("isCanvasOpen: defaults to closed when no provider is set", () => {
+    setCanvasOpenProvider(null);
+    assert.equal(isCanvasOpen(), false);
+});
+
+test("isCanvasOpen: coerces a numeric panel count to open/closed", () => {
+    let count = 0;
+    setCanvasOpenProvider(() => count);
+    assert.equal(isCanvasOpen(), false);
+    count = 1;
+    assert.equal(isCanvasOpen(), true);
+    count = 3;
+    assert.equal(isCanvasOpen(), true);
+    count = 0;
+    assert.equal(isCanvasOpen(), false);
+    setCanvasOpenProvider(null);
+});
+
+test("isCanvasOpen: accepts a boolean provider", () => {
+    setCanvasOpenProvider(() => true);
+    assert.equal(isCanvasOpen(), true);
+    setCanvasOpenProvider(() => false);
+    assert.equal(isCanvasOpen(), false);
+    setCanvasOpenProvider(null);
+});
+
+test("isCanvasOpen: a throwing provider fails safe to closed", () => {
+    setCanvasOpenProvider(() => { throw new Error("boom"); });
+    assert.equal(isCanvasOpen(), false);
+    setCanvasOpenProvider(null);
+});
+
+test("setCanvasOpenProvider: ignores non-function arguments", () => {
+    setCanvasOpenProvider(() => 5);
+    assert.equal(isCanvasOpen(), true);
+    // A bogus provider clears the previous one rather than installing it.
+    setCanvasOpenProvider("not a function");
+    assert.equal(isCanvasOpen(), false);
+});
+
+// --- countDashboardPanels --------------------------------------------------
+//
+// Only panels showing the PR dashboard (NOT inspect mode) should arm the
+// notifier. An entry is in inspect mode when ciRunCount() > 0.
+
+function fakeServers(entries) {
+    return new Map(entries.map((e, i) => [`inst-${i}`, e]));
+}
+
+test("countDashboardPanels: counts only dashboard-mode panels", () => {
+    const servers = fakeServers([
+        { ciRunCount: () => 0 }, // dashboard
+        { ciRunCount: () => 2 }, // inspect mode
+        { ciRunCount: () => 0 }, // dashboard
+    ]);
+    assert.equal(countDashboardPanels(servers), 2);
+});
+
+test("countDashboardPanels: returns 0 when every panel is in inspect mode", () => {
+    const servers = fakeServers([
+        { ciRunCount: () => 1 },
+        { ciRunCount: () => 3 },
+    ]);
+    assert.equal(countDashboardPanels(servers), 0);
+});
+
+test("countDashboardPanels: an inspect-only session does not arm the notifier", () => {
+    const servers = fakeServers([{ ciRunCount: () => 1 }]);
+    setCanvasOpenProvider(() => countDashboardPanels(servers));
+    assert.equal(isCanvasOpen(), false);
+    setCanvasOpenProvider(null);
+});
+
+test("countDashboardPanels: a mixed session (dashboard + inspect) arms the notifier", () => {
+    const servers = fakeServers([
+        { ciRunCount: () => 0 },
+        { ciRunCount: () => 4 },
+    ]);
+    setCanvasOpenProvider(() => countDashboardPanels(servers));
+    assert.equal(isCanvasOpen(), true);
+    setCanvasOpenProvider(null);
+});
+
+test("countDashboardPanels: treats a missing ciRunCount as dashboard mode", () => {
+    // Defensive: an entry without the accessor still counts as a normal panel.
+    assert.equal(countDashboardPanels(fakeServers([{}])), 1);
+});
+
+test("countDashboardPanels: empty or absent server map yields 0", () => {
+    assert.equal(countDashboardPanels(new Map()), 0);
+    assert.equal(countDashboardPanels(undefined), 0);
+    assert.equal(countDashboardPanels(null), 0);
+});
 
 // --- sanitizeNotifyConfig --------------------------------------------------
 

@@ -91,6 +91,16 @@ The agent will open the `ci-runs` canvas in a side panel. From there:
 - Expand `show jobs` on a build to see per-job status with deep links to each job log.
 - Open the `⚙` settings menu to toggle notifications, show others' PRs in the Copilot tab, and configure a **repository filter**.
 
+> **Notification scoping:** the Copilot app runs one process per session, so CI
+> failure / completion alerts are delivered only to the session(s) that
+> currently have the `ci-runs` canvas open **in PR-dashboard mode**. Sessions
+> that never opened the canvas (or have since closed it) receive no alerts, even
+> with notifications enabled. A panel opened in **inspect mode** (with a
+> `ciRunUrl`) hides the PR tabs and does **not** arm the notifier, so inspecting
+> a standalone Azure DevOps run won't surface alerts for unrelated PRs. The
+> notifier keeps tracking CI state while the panel is closed, so reopening it
+> won't replay a backlog of already-settled runs.
+
 ### Showing others' PRs in the Copilot tab
 
 By default the **Copilot** tab lists only sessions whose PR **you authored**, so
