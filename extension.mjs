@@ -22,6 +22,7 @@ import { HOST_POLL_INTERVAL_MS } from "./lib/constants.mjs";
 import { fetchPrsWithChecks } from "./lib/github.mjs";
 import { initNotifyConfig, runNotifyPoll, setActiveSession } from "./lib/notify.mjs";
 import { initRepoFilterConfig } from "./lib/repo-filter.mjs";
+import { initDisplayConfig } from "./lib/display.mjs";
 import { initSettings } from "./lib/settings.mjs";
 import { startServer } from "./lib/server.mjs";
 import { fetchCopilotSessions, filterSessionsByLivePrState } from "./lib/sessions.mjs";
@@ -129,6 +130,9 @@ await initSettings();
 // Load the repo filter config (include/exclude globs) before any fetch so
 // the first session/PR query already respects it. Empty lists = no filtering.
 await initRepoFilterConfig();
+
+// Load display preferences (e.g. whether the Copilot tab shows others' PRs).
+await initDisplayConfig();
 
 // Host-side failure-notifier loop. Runs regardless of whether the canvas
 // panel is open, so the user gets alerts even with the side panel closed.

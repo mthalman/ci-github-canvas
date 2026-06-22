@@ -88,6 +88,29 @@ test("DELETE /api/notify-config → 405", async () => {
     assert.equal(r.status, 405);
 });
 
+test("GET /api/display-config returns the in-memory config", async () => {
+    const r = await fetch(`${baseUrl}/api/display-config`);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(typeof body.config, "object");
+    assert.equal(typeof body.config.showOtherSessions, "boolean");
+});
+
+test("DELETE /api/display-config → 405", async () => {
+    const r = await fetch(`${baseUrl}/api/display-config`, { method: "DELETE" });
+    assert.equal(r.status, 405);
+});
+
+test("GET /api/session-checks returns a rows array (gh/DB errors tolerated)", async () => {
+    // No network/DB guarantee in CI: the route must still return a JSON object
+    // with a rows array, surfacing any underlying error in the `error` field
+    // rather than throwing a 500.
+    const r = await fetch(`${baseUrl}/api/session-checks`);
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.ok(Array.isArray(body.rows));
+});
+
 test("GET /api/repo-filter returns the in-memory config", async () => {
     const r = await fetch(`${baseUrl}/api/repo-filter`);
     assert.equal(r.status, 200);

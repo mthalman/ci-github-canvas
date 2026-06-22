@@ -2,7 +2,7 @@
 
 A [canvas extension](https://docs.github.com/en/copilot/how-tos/github-copilot-app/working-with-canvas-extensions) for the [GitHub Copilot app](https://github.com/github/app) that surfaces a side-panel dashboard of:
 
-1. **Copilot tab** — pull requests currently in scope as Copilot project sessions on this machine, read directly from `~/.copilot/data.db`.
+1. **Copilot tab** — pull requests currently in scope as Copilot project sessions on this machine, read directly from `~/.copilot/data.db`. By default this lists only sessions for PRs **you authored**; flip **Show others' PRs** in the `⚙` settings menu to also include sessions for PRs others authored (e.g. codeflow/bot PRs), along with their CI run trees.
 2. **All my PRs tab** — every open pull request you authored across GitHub, with their **Azure Pipelines** check status grouped by build, deep-linked into each AzDO job log.
 3. **Watched tab** — a manually curated list of any GitHub PRs (yours or not) you want to keep an eye on. Paste a PR URL to start tracking its CI; remove with the ✕ button. Watched PRs participate in the failure / completion notifier the same way authored PRs do.
 4. **Inspect mode** — when the canvas is opened with one or more `ciRunUrl` input parameters pointing at **Azure DevOps** pipeline runs, the surface is dedicated to inspecting those runs (the PR tabs are hidden). Lets you inspect a branch's CI run *before* a PR exists. Re-opening the same panel with another run URL adds it to the list; each run has a ✕ button to remove it. Public pipelines are read anonymously; private pipelines authenticate through the Azure CLI.
@@ -89,7 +89,19 @@ The agent will open the `ci-runs` canvas in a side panel. From there:
 - Click `↻ Refresh` to re-read the local session DB and re-query GitHub.
 - Click the AzDO build link to open the run in `dev.azure.com`.
 - Expand `show jobs` on a build to see per-job status with deep links to each job log.
-- Open the `⚙` settings menu to toggle notifications and configure a **repository filter**.
+- Open the `⚙` settings menu to toggle notifications, show others' PRs in the Copilot tab, and configure a **repository filter**.
+
+### Showing others' PRs in the Copilot tab
+
+By default the **Copilot** tab lists only sessions whose PR **you authored**, so
+sessions opened against codeflow/bot PRs (e.g. "Source code updates from …") are
+hidden. Enable **Show others' PRs (not just mine)** in the `⚙` settings menu to
+also list those sessions and fetch their CI run trees. The tab count then reads
+`(shown of total)` so you can see how many sessions are hidden when the toggle
+is off, and each not-yours row gets an `@author` badge. The preference persists
+to the `display` section of `artifacts/settings.json`. This setting only affects
+the Copilot tab's display — it does not change the failure/completion notifier,
+which continues to watch your authored and watched PRs.
 
 ### Inspecting a CI run by URL
 
