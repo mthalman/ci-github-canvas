@@ -20,7 +20,7 @@ import { joinSession, createCanvas } from "@github/copilot-sdk/extension";
 
 import { HOST_POLL_INTERVAL_MS } from "./lib/constants.mjs";
 import { fetchPrsWithChecks } from "./lib/github.mjs";
-import { initNotifyConfig, runNotifyPoll, setActiveSession, setCanvasOpenProvider, countDashboardPanels } from "./lib/notify.mjs";
+import { initNotifyConfig, runNotifyPoll, setActiveSession, setDashboardSessionsProvider, dashboardSessionIds } from "./lib/notify.mjs";
 import { initRepoFilterConfig } from "./lib/repo-filter.mjs";
 import { initDisplayConfig } from "./lib/display.mjs";
 import { initSettings } from "./lib/settings.mjs";
@@ -81,6 +81,12 @@ const session = await joinSession({
                     // (deduped) rather than replacing what's already shown.
                     entry.addCiRunUrl?.(ciRunUrl);
                 }
+                // Record which session opened this panel so the notifier can
+                // route CI alerts back to it specifically. A single extension
+                // process fields canvas opens from every session, so without
+                // this every alert would land in the one session the process
+                // happened to join at startup.
+                entry.sessionId = ctx.sessionId;
                 // Inspect mode is determined by whether the panel holds any runs
                 // (set on this open or a previous one), not just the current
                 // call's input — so re-opening/focusing an inspect panel without
@@ -115,19 +121,21 @@ const session = await joinSession({
     ],
 });
 
-// Hand the session handle to the notifier so runNotifyPoll() can fire
-// session.send() alerts from its background timer. Must happen before
+// Hand the joined session to the notifier. This is NOT "the session to alert" —
+// it's the handle the notifier uses to reach the shared RPC connection so it can
+// post alerts to whichever session has the canvas open. Must happen before
 // initNotifyConfig / runNotifyPoll so the first poll has the handle.
 setActiveSession(session);
 
-// Tell the notifier whether this session is actively watching PRs on the
-// canvas. The Copilot app runs one process per session, so this notifier owns
-// only this session's handle. `servers` holds one entry per open canvas panel
-// (added in `open`, removed in `onClose`); we count only panels in PR-dashboard
-// mode (not inspect mode), because inspect-mode panels hide the PR tabs and so
-// shouldn't trigger PR failure/completion alerts unrelated to the runs they're
-// inspecting.
-setCanvasOpenProvider(() => countDashboardPanels(servers));
+// Tell the notifier which sessions are actively watching PRs on the canvas. A
+// single extension process fields canvas opens from every session, so `servers`
+// holds one entry per open panel across all sessions (added in `open`, removed
+// in `onClose`), each tagged with the sessionId that opened it. We surface only
+// panels in PR-dashboard mode (not inspect mode), because inspect-mode panels
+// hide the PR tabs and so shouldn't trigger PR failure/completion alerts
+// unrelated to the runs they're inspecting. The joined session id is the
+// fallback for any entry opened before session tracking existed.
+setDashboardSessionsProvider(() => dashboardSessionIds(servers, session.sessionId));
 
 await session.log("ci-runs extension ready (v0.3)");
 
@@ -144,8 +152,8 @@ await initRepoFilterConfig();
 await initDisplayConfig();
 
 // Host-side failure-notifier loop. Polls on a fixed timer regardless of canvas
-// state so its diff baseline stays current, but only fires session.send() when
-// this session has the canvas open (see setCanvasOpenProvider above) — that
+// state so its diff baseline stays current, but only posts alerts to sessions
+// that have the dashboard open (see setDashboardSessionsProvider above) — that
 // keeps alerts scoped to the session(s) actively watching the panel instead of
 // every session that loaded the extension. The first call seeds state silently;
 // subsequent calls fire when a build (or job) transitions to a reportable state.
