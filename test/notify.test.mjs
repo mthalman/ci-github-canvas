@@ -20,109 +20,130 @@ import {
     formatAlertMessage,
     sanitizePromptText,
     sanitizePromptUrl,
-    setCanvasOpenProvider,
+    setDashboardSessionsProvider,
+    getDashboardSessionIds,
     isCanvasOpen,
-    countDashboardPanels,
+    dashboardSessionIds,
 } from "../lib/notify.mjs";
 
 // --- canvas-open gate ------------------------------------------------------
 //
-// The notifier only fires session.send() when this session has the canvas
-// open. isCanvasOpen() reflects whatever provider extension.mjs wires up
-// (servers.size in practice). These tests pin the coercion + fail-safe rules.
+// The notifier only posts alerts to sessions that have the CI Runs dashboard
+// open. getDashboardSessionIds() returns whatever session-id list extension.mjs
+// wires up (derived from the servers map); isCanvasOpen() is the boolean gate
+// over it. These tests pin the sanitize + fail-safe rules.
 
-test("isCanvasOpen: defaults to closed when no provider is set", () => {
-    setCanvasOpenProvider(null);
+test("getDashboardSessionIds: defaults to empty when no provider is set", () => {
+    setDashboardSessionsProvider(null);
+    assert.deepEqual(getDashboardSessionIds(), []);
     assert.equal(isCanvasOpen(), false);
 });
 
-test("isCanvasOpen: coerces a numeric panel count to open/closed", () => {
-    let count = 0;
-    setCanvasOpenProvider(() => count);
-    assert.equal(isCanvasOpen(), false);
-    count = 1;
+test("getDashboardSessionIds: returns the provider's session ids, deduped", () => {
+    setDashboardSessionsProvider(() => ["s1", "s2", "s1"]);
+    assert.deepEqual(getDashboardSessionIds(), ["s1", "s2"]);
     assert.equal(isCanvasOpen(), true);
-    count = 3;
-    assert.equal(isCanvasOpen(), true);
-    count = 0;
-    assert.equal(isCanvasOpen(), false);
-    setCanvasOpenProvider(null);
+    setDashboardSessionsProvider(null);
 });
 
-test("isCanvasOpen: accepts a boolean provider", () => {
-    setCanvasOpenProvider(() => true);
-    assert.equal(isCanvasOpen(), true);
-    setCanvasOpenProvider(() => false);
-    assert.equal(isCanvasOpen(), false);
-    setCanvasOpenProvider(null);
+test("getDashboardSessionIds: drops empty/non-string entries", () => {
+    setDashboardSessionsProvider(() => ["s1", "", null, 5, "s2"]);
+    assert.deepEqual(getDashboardSessionIds(), ["s1", "s2"]);
+    setDashboardSessionsProvider(null);
 });
 
-test("isCanvasOpen: a throwing provider fails safe to closed", () => {
-    setCanvasOpenProvider(() => { throw new Error("boom"); });
+test("getDashboardSessionIds: a non-array return value yields empty", () => {
+    setDashboardSessionsProvider(() => "nope");
+    assert.deepEqual(getDashboardSessionIds(), []);
     assert.equal(isCanvasOpen(), false);
-    setCanvasOpenProvider(null);
+    setDashboardSessionsProvider(null);
 });
 
-test("setCanvasOpenProvider: ignores non-function arguments", () => {
-    setCanvasOpenProvider(() => 5);
+test("getDashboardSessionIds: a throwing provider fails safe to empty", () => {
+    setDashboardSessionsProvider(() => { throw new Error("boom"); });
+    assert.deepEqual(getDashboardSessionIds(), []);
+    assert.equal(isCanvasOpen(), false);
+    setDashboardSessionsProvider(null);
+});
+
+test("setDashboardSessionsProvider: ignores non-function arguments", () => {
+    setDashboardSessionsProvider(() => ["s1"]);
     assert.equal(isCanvasOpen(), true);
     // A bogus provider clears the previous one rather than installing it.
-    setCanvasOpenProvider("not a function");
+    setDashboardSessionsProvider("not a function");
     assert.equal(isCanvasOpen(), false);
 });
 
-// --- countDashboardPanels --------------------------------------------------
+// --- dashboardSessionIds ---------------------------------------------------
 //
 // Only panels showing the PR dashboard (NOT inspect mode) should arm the
-// notifier. An entry is in inspect mode when ciRunCount() > 0.
+// notifier, and each contributes the sessionId that opened it. An entry is in
+// inspect mode when ciRunCount() > 0.
 
 function fakeServers(entries) {
     return new Map(entries.map((e, i) => [`inst-${i}`, e]));
 }
 
-test("countDashboardPanels: counts only dashboard-mode panels", () => {
+test("dashboardSessionIds: collects session ids of dashboard-mode panels only", () => {
     const servers = fakeServers([
-        { ciRunCount: () => 0 }, // dashboard
-        { ciRunCount: () => 2 }, // inspect mode
-        { ciRunCount: () => 0 }, // dashboard
+        { ciRunCount: () => 0, sessionId: "s1" }, // dashboard
+        { ciRunCount: () => 2, sessionId: "s2" }, // inspect mode
+        { ciRunCount: () => 0, sessionId: "s3" }, // dashboard
     ]);
-    assert.equal(countDashboardPanels(servers), 2);
+    assert.deepEqual(dashboardSessionIds(servers), ["s1", "s3"]);
 });
 
-test("countDashboardPanels: returns 0 when every panel is in inspect mode", () => {
+test("dashboardSessionIds: dedupes when one session has multiple dashboard panels", () => {
     const servers = fakeServers([
-        { ciRunCount: () => 1 },
-        { ciRunCount: () => 3 },
+        { ciRunCount: () => 0, sessionId: "s1" },
+        { ciRunCount: () => 0, sessionId: "s1" },
     ]);
-    assert.equal(countDashboardPanels(servers), 0);
+    assert.deepEqual(dashboardSessionIds(servers), ["s1"]);
 });
 
-test("countDashboardPanels: an inspect-only session does not arm the notifier", () => {
-    const servers = fakeServers([{ ciRunCount: () => 1 }]);
-    setCanvasOpenProvider(() => countDashboardPanels(servers));
+test("dashboardSessionIds: returns empty when every panel is in inspect mode", () => {
+    const servers = fakeServers([
+        { ciRunCount: () => 1, sessionId: "s1" },
+        { ciRunCount: () => 3, sessionId: "s2" },
+    ]);
+    assert.deepEqual(dashboardSessionIds(servers), []);
+});
+
+test("dashboardSessionIds: an inspect-only session does not arm the notifier", () => {
+    const servers = fakeServers([{ ciRunCount: () => 1, sessionId: "s1" }]);
+    setDashboardSessionsProvider(() => dashboardSessionIds(servers));
     assert.equal(isCanvasOpen(), false);
-    setCanvasOpenProvider(null);
+    setDashboardSessionsProvider(null);
 });
 
-test("countDashboardPanels: a mixed session (dashboard + inspect) arms the notifier", () => {
+test("dashboardSessionIds: a mixed session (dashboard + inspect) arms the notifier", () => {
     const servers = fakeServers([
-        { ciRunCount: () => 0 },
-        { ciRunCount: () => 4 },
+        { ciRunCount: () => 0, sessionId: "s1" },
+        { ciRunCount: () => 4, sessionId: "s2" },
     ]);
-    setCanvasOpenProvider(() => countDashboardPanels(servers));
+    setDashboardSessionsProvider(() => dashboardSessionIds(servers));
+    assert.deepEqual(getDashboardSessionIds(), ["s1"]);
     assert.equal(isCanvasOpen(), true);
-    setCanvasOpenProvider(null);
+    setDashboardSessionsProvider(null);
 });
 
-test("countDashboardPanels: treats a missing ciRunCount as dashboard mode", () => {
-    // Defensive: an entry without the accessor still counts as a normal panel.
-    assert.equal(countDashboardPanels(fakeServers([{}])), 1);
+test("dashboardSessionIds: falls back to fallbackSessionId when an entry has none", () => {
+    // Defensive: an entry without a sessionId (e.g. opened before tracking) still
+    // gets an alert via the provided fallback rather than being skipped.
+    const servers = fakeServers([{ ciRunCount: () => 0 }]);
+    assert.deepEqual(dashboardSessionIds(servers, "fallback"), ["fallback"]);
+    // With no fallback there is nothing to deliver to.
+    assert.deepEqual(dashboardSessionIds(servers), []);
 });
 
-test("countDashboardPanels: empty or absent server map yields 0", () => {
-    assert.equal(countDashboardPanels(new Map()), 0);
-    assert.equal(countDashboardPanels(undefined), 0);
-    assert.equal(countDashboardPanels(null), 0);
+test("dashboardSessionIds: treats a missing ciRunCount as dashboard mode", () => {
+    assert.deepEqual(dashboardSessionIds(fakeServers([{ sessionId: "s1" }])), ["s1"]);
+});
+
+test("dashboardSessionIds: empty or absent server map yields empty", () => {
+    assert.deepEqual(dashboardSessionIds(new Map()), []);
+    assert.deepEqual(dashboardSessionIds(undefined), []);
+    assert.deepEqual(dashboardSessionIds(null), []);
 });
 
 // --- sanitizeNotifyConfig --------------------------------------------------
