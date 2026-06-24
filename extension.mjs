@@ -74,7 +74,7 @@ const session = await joinSession({
                 const ciRunUrl = typeof ctx.input?.ciRunUrl === "string" ? ctx.input.ciRunUrl.trim() : "";
                 let entry = servers.get(ctx.instanceId);
                 if (!entry) {
-                    entry = await startServer({ ciRunUrl });
+                    entry = await startServer({ ciRunUrl, instanceId: ctx.instanceId });
                     servers.set(ctx.instanceId, entry);
                 } else {
                     // Re-open of an existing panel: add this run to the panel
