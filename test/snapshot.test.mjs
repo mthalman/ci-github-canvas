@@ -51,6 +51,16 @@ test("sanitizeSnapshot: rejects oversize html and bad shapes", () => {
     assert.equal(sanitizeSnapshot({}), null);
     // Oversize HTML is dropped, leaving nothing worth persisting.
     assert.equal(sanitizeSnapshot({ html: { "panel-all": "x".repeat(600 * 1024) } }), null);
+    // The cap is measured in UTF-8 bytes, not UTF-16 code units: a multi-byte
+    // string whose .length is under the cap but whose byte size is over it must
+    // still be rejected. "€" is one code unit but three UTF-8 bytes, so 100K of
+    // them = ~100K code units (under) but ~300KB (over).
+    assert.equal(sanitizeSnapshot({ html: { "panel-all": "\u20ac".repeat(100 * 1024) } }), null);
+    // A panel right under the byte cap is kept.
+    assert.deepEqual(
+        sanitizeSnapshot({ html: { "panel-all": "x".repeat(1024) } }),
+        { html: { "panel-all": "x".repeat(1024) } },
+    );
     // Unknown tab is dropped.
     assert.equal(sanitizeSnapshot({ activeTab: "bogus" }), null);
     // inspect only persists when strictly true.
